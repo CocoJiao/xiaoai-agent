@@ -625,6 +625,11 @@ pub fn require_music_enabled(config: &AppConfig) -> anyhow::Result<()> {
 }
 
 pub fn timeout_duration(seconds: f64) -> Duration {
+    // .inf / NaN（yaml 写 .inf 或算出 infinity）会让 from_secs_f64 panic，
+    // 而 release 编译是 panic = "abort"，等于配置写错就把进程打死。
+    if !seconds.is_finite() {
+        return Duration::from_secs_f64(30.0);
+    }
     Duration::from_secs_f64(seconds.max(0.1))
 }
 
@@ -645,7 +650,7 @@ fn resolve_optional_path(root: &Path, path: &mut Option<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        openai_base_url, openai_realtime_base_url, AppConfig, AsrConfig, AsrProvider, LlmConfig,
+        openai_base_url, openai_realtime_base_url, timeout_duration, AppConfig, AsrConfig, AsrProvider, LlmConfig,
         LlmProtocol, LlmThinkingMode, McpConfig,
     };
 
@@ -736,6 +741,14 @@ mod tests {
             openai_realtime_base_url("http://192.168.1.10:8000/realtime"),
             "http://192.168.1.10:8000/realtime"
         );
+    }
+
+    #[test]
+    fn base_url_keeps_empty_input_as_is() {
+        assert_eq!(openai_base_url(""), "");
+        assert_eq!(openai_realtime_base_url(""), "");
+        assert_eq!(timeout_duration(f64::INFINITY), std::time::Duration::from_secs(30));
+        assert_eq!(timeout_duration(f64::NAN), std::time::Duration::from_secs(30));
     }
 
     #[test]

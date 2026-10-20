@@ -259,15 +259,22 @@ impl AgentRuntime {
             self.config.llm.thinking.budget_tokens,
         );
         if self.config.llm.thinking.mode == LlmThinkingMode::Enabled {
+            const MIN_BUDGET: u64 = 1024;
             let max = self.config.llm.max_tokens;
             let wanted = self.config.llm.thinking.budget_tokens;
-            if wanted >= max || wanted < 1024 {
-                let clamped = (max / 2).clamp(256, max.saturating_sub(1).max(256));
+            if wanted < MIN_BUDGET || wanted >= max {
+                // 合法区间是 [1024, max_tokens)。区间为空说明 max_tokens 太小，
+                // 静默给一个非法值只会换来 400，这里直接报出人话错误。
+                anyhow::ensure!(
+                    max > MIN_BUDGET,
+                    "llm.thinking.mode=enabled 需要 llm.thinking.budget_tokens 落在                      [1024, llm.max_tokens) 区间，但 llm.max_tokens={max} 太小；                     请把 llm.max_tokens 调到 2048 以上（或把 thinking.mode 设回 auto）"
+                );
+                let clamped = wanted.clamp(MIN_BUDGET, max - 1);
                 warn!(
                     wanted,
                     max_tokens = max,
                     clamped,
-                    "llm.thinking.budget_tokens out of range, clamped automatically"
+                    "llm.thinking.budget_tokens out of range, clamped into [1024, max_tokens)"
                 );
                 thinking_params =
                     anthropic_thinking_params(&LlmThinkingMode::Enabled, clamped);
@@ -331,7 +338,7 @@ fn openai_thinking_params(mode: &LlmThinkingMode) -> Value {
     match mode {
         // Auto / Disabled 都不发参数：reasoning_effort、enable_thinking、
         // chat_template_kwargs 都是特定厂商（OpenAI 推理模型 / Qwen 系）的方言，
-        // 换成严格代理或其它模型时会被 400 拒绝。需要时请用 llm.extra_params 显式传。
+        // 换成严格代理或其它模型时会被 400 拒绝。确实需要时再按目标模型单独加回。
         LlmThinkingMode::Auto | LlmThinkingMode::Disabled => json!({}),
         LlmThinkingMode::Enabled => json!({ "enable_thinking": true }),
     }
