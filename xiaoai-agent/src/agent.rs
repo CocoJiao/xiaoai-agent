@@ -132,7 +132,15 @@ impl AgentRuntime {
             control.end_reason.clear();
         }
 
-        let prompt = self.prompt_with_history(message).await;
+        // 关闭工具时（例如后端代理不支持 tools API），模型拿不到当前时间，
+        // 问"现在几点"会答"不方便查询"。这里把时间直接注入用户消息。
+        let message_with_time = if self.config.agent.inject_current_time {
+            format!("{}{}", self.now_prefix(), message)
+        } else {
+            message.to_string()
+        };
+
+        let prompt = self.prompt_with_history(&message_with_time).await;
         let text = self.prompt_once(prompt).await?;
 
         let control = self.control.lock().await;
@@ -142,6 +150,32 @@ impl AgentRuntime {
             should_end: control.should_end,
             end_reason: control.end_reason.clone(),
         })
+    }
+
+    /// 把当前时间写进用户消息，供关闭工具时的模型使用。
+    fn now_prefix(&self) -> String {
+        use chrono::Utc;
+        let tz: chrono_tz::Tz = self
+            .config
+            .agent
+            .timezone
+            .parse()
+            .unwrap_or(chrono_tz::Asia::Shanghai);
+        let now = Utc::now().with_timezone(&tz);
+        let weekday = match now.format("%u").to_string().as_str() {
+            "1" => "一",
+            "2" => "二",
+            "3" => "三",
+            "4" => "四",
+            "5" => "五",
+            "6" => "六",
+            _ => "日",
+        };
+        format!(
+            "【当前时间：{} 星期{}】\n",
+            now.format("%Y年%m月%d日 %H:%M"),
+            weekday
+        )
     }
 
     async fn prompt_once(&self, prompt: String) -> anyhow::Result<String> {

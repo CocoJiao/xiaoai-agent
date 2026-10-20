@@ -314,6 +314,8 @@ pub struct AgentConfig {
     pub timezone: String,
     pub weather: WeatherConfig,
     pub web_search: WebSearchConfig,
+    /// 是否把当前时间注入用户消息（关闭工具时，模型仍能回答时间/日期类问题）。
+    pub inject_current_time: bool,
     /// 是否向 LLM 注册工具（内置 + MCP）。
     /// 某些 OpenAI 兼容代理会丢弃 tool_calls 内容，表现为
     /// "Response contained no message or tool call (empty)"；
@@ -327,6 +329,7 @@ impl Default for AgentConfig {
             timezone: "Asia/Shanghai".to_string(),
             weather: WeatherConfig::default(),
             web_search: WebSearchConfig::default(),
+            inject_current_time: true,
             tools_enabled: true,
         }
     }
