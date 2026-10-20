@@ -42,11 +42,33 @@ else
     exit 1
 fi
 
-if command -v gstat >/dev/null 2>&1; then
-    SIZE=$(gstat -L -c %s "$FIRMWARE/root-patched.squashfs")
-else
-    SIZE=$(stat -f %z "$FIRMWARE/root-patched.squashfs")
-fi
+# 取文件字节数，跨平台：
+#   - GNU coreutils / busybox: stat -c %s
+#   - BSD / macOS:             stat -f %z（或 gstat -c %s）
+# 只用其中一个会在另一个平台上取到空值或多行文件系统信息，后面 $(( )) 直接报错。
+file_size_bytes() {
+    _f="$1"
+    if command -v gstat >/dev/null 2>&1; then
+        gstat -L -c %s "$_f" 2>/dev/null && return 0
+    fi
+    if stat -c %s "$_f" >/dev/null 2>&1; then
+        stat -c %s "$_f"
+        return 0
+    fi
+    if stat -f %z "$_f" >/dev/null 2>&1; then
+        stat -f %z "$_f"
+        return 0
+    fi
+    wc -c < "$_f" | tr -d ' '
+}
+
+SIZE=$(file_size_bytes "$FIRMWARE/root-patched.squashfs")
+case "$SIZE" in
+    '' | *[!0-9]*)
+        echo "❌ 无法读取固件大小（得到: ${SIZE:-空}），中止构建" >&2
+        exit 1
+        ;;
+esac
 SIZE_MB=$((SIZE / 1024 / 1024))
 IMAGE_MAX_SIZE_MB=$((IMAGE_MAX_SIZE / 1024 / 1024))
 
