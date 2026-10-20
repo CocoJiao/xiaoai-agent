@@ -103,6 +103,16 @@ cp xiaoai-agent/agent.example.yaml xiaoai-agent/agent.yaml
   对 FunASR，`target_sample_rate` 必须保持 `16000`；不支持服务端 VAD 的兼容服务可将
   `asr.openai_realtime.server_vad.enabled` 设为 `false`，退回本地 energy 端点检测
 - `llm.protocol`、`llm.base_url`、`llm.api_key`、`llm.model`：大模型服务配置。
+  `base_url` 已带路径（如 `/v1`、`/api/v3`）时原样使用，**不再自动补 `/v1`**。
+- `agent.tools_enabled`（默认 `true`）：是否向大模型注册工具（内置 + MCP）。
+  后端是"不支持 tools API"的兼容代理（表现为带工具时返回空的 tool_calls）时设为 `false`，
+  此时会改用不含工具指令的 preamble，模型不会声称执行了动作；`end_conversation`
+  也随之消失，会话改由 `runtime.session_idle_timeout_s`（默认 20 秒）空闲结束。
+- `agent.inject_current_time`（默认 `false`）：把当前时间注入用户消息。
+  `tools_enabled=false` 时自动生效；开着工具时建议保持关闭，让 `get_current_time`
+  工具返回带时区/星期的结构化结果。
+- `device.command_timeout_s`（默认 `30`）：单条设备命令的最长执行时间。
+  系统 TTS 是同步播放，长回复可能需要 50~80 秒，建议按需调到 `60`。
   `protocol` 可选 `open_ai_chat` 或 `anthropic`；Anthropic-compatible 服务可通过
   `thinking.mode` 控制推理。
 - `mcp.servers`：通用 MCP server 列表；每个 server 可独立配置 URL、token、timeout 和工具 allowlist

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use crate::shell::DEFAULT_COMMAND_TIMEOUT;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -88,7 +89,7 @@ impl Default for DeviceConfig {
     fn default() -> Self {
         Self {
             tts_command: "/usr/sbin/tts_play.sh --notify-pns {text}".to_string(),
-            command_timeout_s: 30.0,
+            command_timeout_s: DEFAULT_COMMAND_TIMEOUT.as_secs_f64(),
             play_url_command:
                 "killall miplayer 2>/dev/null; miplayer -f {url} >/tmp/xiaoai-miplayer.log 2>&1 &"
                     .to_string(),

@@ -67,6 +67,7 @@ asr:
 llm:
   # anthropic or open_ai_chat
   protocol: anthropic
+  # 注意：base_url 已带路径（如 /v1、/api/v3）时原样使用，不再自动补 /v1。
   base_url: https://api.openai.com/v1
   api_key: EMPTY
   model: gpt-5.4-mini
