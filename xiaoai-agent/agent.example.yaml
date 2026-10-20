@@ -3,6 +3,8 @@ runtime:
   session_idle_timeout_s: 20
 
 device:
+  # 单条设备命令（tts_play.sh / miplayer / ubus）的最长执行时间，秒
+  command_timeout_s: 30.0
   tts_command: "/usr/sbin/tts_play.sh --notify-pns {text}"
   play_url_command: "killall miplayer 2>/dev/null; miplayer -f {url} >/tmp/xiaoai-miplayer.log 2>&1 &"
   stop_audio_command: "killall tts_play.sh miplayer 2>/dev/null; mphelper pause"
@@ -34,6 +36,7 @@ asr:
   provider: open_ai
 
   # OpenAI-compatible ASR settings. Used when provider is open_ai.
+  # 注意：base_url 已带路径（如 /v1 或 /api/v3）时原样使用，不再自动补 /v1。
   open_ai:
     base_url: https://api.openai.com/v1
     api_key: EMPTY
@@ -76,6 +79,10 @@ llm:
     budget_tokens: 1024
 
 agent:
+  # 后端 OpenAI 兼容代理若不支持 tools API（会丢弃 tool_calls 内容），设 false
+  tools_enabled: true
+  # 关闭工具时把当前时间注入用户消息；tools_enabled=false 时自动生效
+  inject_current_time: false
   timezone: Asia/Shanghai
   weather:
     qweather_url: ""

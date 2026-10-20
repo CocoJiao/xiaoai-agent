@@ -54,6 +54,9 @@ jobs:
         working-directory: ${{ env.AGENT_DIR }}
         run: cargo +"$RUST_TOOLCHAIN" check --locked --bin xiaoai-agent
 
+      - name: Test
+        run: cargo +"$RUST_TOOLCHAIN" test --locked --bin xiaoai-agent
+
       - name: Build release binary
         working-directory: ${{ env.AGENT_DIR }}
         run: cargo +"$RUST_TOOLCHAIN" zigbuild --release --locked --target "$ZIGBUILD_TARGET" --bin xiaoai-agent

@@ -48,6 +48,25 @@ pub const SPEAKER_AGENT_INSTRUCTIONS: &str = concat!(
     "如果工具返回错误或信息不足，要坦率说明无法确认。"
 );
 
+/// 关闭工具时使用的 preamble。
+/// 原来的 preamble 会命令模型"必须调用工具"，而 tools_enabled=false 时那些工具
+/// 根本不存在，模型会谎称"正在为你播放"或直接说"我无法查询"，体验更差。
+pub const SPEAKER_AGENT_INSTRUCTIONS_NO_TOOLS: &str = concat!(
+    "你是小爱同学，一个运行在小爱音箱上的中文语音助手。",
+    "你运行在小爱音箱端侧；端侧程序负责语音唤醒、云端 ASR、TTS 和播放控制。",
+    "你负责根据用户文本请求完成任务并返回适合朗读的文本。",
+    "直接给最终答案，不要输出思考过程。",
+    "回答要自然、简短、适合直接朗读。",
+    "通常只说一到两句话，除非用户明确要求详细解释。",
+    "不要使用 Markdown，不要列太长的清单。",
+    "【重要】当前没有任何工具可用：你无法播放音乐、无法控制智能家居、无法联网搜索、无法查询实时数据。",
+    "遇到这类请求，直接简短说明你做不到，并建议用户换个问法或请管理员开启工具；",
+    "绝对不要声称你已经执行了某个动作。",
+    "用户消息开头会给出当前时间；用户问时间或日期时直接使用它。",
+    "对于天气、新闻、股价等需要实时数据的请求，说明你拿不到实时数据。",
+    "如果用户表达再见、拜拜、不用了、先这样等结束意图，直接用一句简短告别回复。"
+);
+
 #[derive(Debug, Clone)]
 pub struct AgentTurnResult {
     pub text: String,
@@ -133,8 +152,10 @@ impl AgentRuntime {
         }
 
         // 关闭工具时（例如后端代理不支持 tools API），模型拿不到当前时间，
-        // 问"现在几点"会答"不方便查询"。这里把时间直接注入用户消息。
-        let message_with_time = if self.config.agent.inject_current_time {
+        // 问"现在几点"会答"不方便查询"。默认只在没有工具时注入；
+        // inject_current_time=true 可强制注入（工具存在时也能省一次工具调用）。
+        let inject_time = self.config.agent.inject_current_time || !self.config.agent.tools_enabled;
+        let message_with_time = if inject_time {
             format!("{}{}", self.now_prefix(), message)
         } else {
             message.to_string()
@@ -150,6 +171,15 @@ impl AgentRuntime {
             should_end: control.should_end,
             end_reason: control.end_reason.clone(),
         })
+    }
+
+    /// 按是否注册工具选择 preamble，避免"命令模型调用不存在的工具"。
+    fn preamble(&self) -> &'static str {
+        if self.config.agent.tools_enabled {
+            SPEAKER_AGENT_INSTRUCTIONS
+        } else {
+            SPEAKER_AGENT_INSTRUCTIONS_NO_TOOLS
+        }
     }
 
     /// 把当前时间写进用户消息，供关闭工具时的模型使用。
@@ -205,7 +235,7 @@ impl AgentRuntime {
 
         let agent = client
             .agent(self.config.llm.model.as_str())
-            .preamble(SPEAKER_AGENT_INSTRUCTIONS)
+            .preamble(self.preamble())
             .temperature(self.config.llm.temperature)
             .max_tokens(self.config.llm.max_tokens)
             .default_max_turns(3)
@@ -240,7 +270,7 @@ impl AgentRuntime {
 
         let mut builder = client
             .agent(self.config.llm.model.as_str())
-            .preamble(SPEAKER_AGENT_INSTRUCTIONS)
+            .preamble(self.preamble())
             .max_tokens(self.config.llm.max_tokens)
             .default_max_turns(3)
             .additional_params(anthropic_thinking_params(

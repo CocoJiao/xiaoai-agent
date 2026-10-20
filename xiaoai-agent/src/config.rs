@@ -67,6 +67,9 @@ impl Default for RuntimeConfig {
 #[serde(default)]
 pub struct DeviceConfig {
     pub tts_command: String,
+    /// 单条设备命令（tts_play.sh / miplayer / ubus 等）的最长执行时间。
+    /// 同步播放的长回复可能接近这个上限，按需调大。
+    pub command_timeout_s: f64,
     pub play_url_command: String,
     pub stop_audio_command: String,
     pub pause_audio_command: String,
@@ -85,6 +88,7 @@ impl Default for DeviceConfig {
     fn default() -> Self {
         Self {
             tts_command: "/usr/sbin/tts_play.sh --notify-pns {text}".to_string(),
+            command_timeout_s: 30.0,
             play_url_command:
                 "killall miplayer 2>/dev/null; miplayer -f {url} >/tmp/xiaoai-miplayer.log 2>&1 &"
                     .to_string(),
@@ -329,7 +333,7 @@ impl Default for AgentConfig {
             timezone: "Asia/Shanghai".to_string(),
             weather: WeatherConfig::default(),
             web_search: WebSearchConfig::default(),
-            inject_current_time: true,
+            inject_current_time: false,
             tools_enabled: true,
         }
     }
@@ -691,6 +695,31 @@ mod tests {
         assert_eq!(config.protocol, LlmProtocol::Anthropic);
         assert_eq!(config.thinking.mode, LlmThinkingMode::Disabled);
         assert_eq!(config.thinking.budget_tokens, 2048);
+    }
+
+    #[test]
+    fn openai_base_url_keeps_existing_path() {
+        // 已带路径的兼容端点不能被强补 /v1（否则变成 /api/v3/v1 → 404）
+        assert_eq!(
+            openai_base_url("https://ark.cn-beijing.volces.com/api/v3"),
+            "https://ark.cn-beijing.volces.com/api/v3"
+        );
+        assert_eq!(
+            openai_base_url("http://192.168.1.106:8088/v1"),
+            "http://192.168.1.106:8088/v1"
+        );
+    }
+
+    #[test]
+    fn openai_base_url_appends_v1_for_bare_host() {
+        assert_eq!(
+            openai_base_url("http://192.168.1.10:8000"),
+            "http://192.168.1.10:8000/v1"
+        );
+        assert_eq!(
+            openai_base_url("https://api.openai.com/"),
+            "https://api.openai.com/v1"
+        );
     }
 
     #[test]
