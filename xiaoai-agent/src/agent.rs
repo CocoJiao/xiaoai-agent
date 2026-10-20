@@ -76,27 +76,36 @@ impl AgentRuntime {
         music: Arc<MusicService>,
     ) -> anyhow::Result<Self> {
         let control = Arc::new(Mutex::new(AgentControl::default()));
-        let tool_server = ToolServer::new()
-            .tool(GetCurrentTime::new(config.clone()))
-            .tool(GetWeather::new(config.clone()))
-            .tool(WebSearch::new(config.clone()))
-            .tool(EndConversation::new(control.clone()))
-            .tool(SearchMusic::new(music.clone()))
-            .tool(RequestMusicLoginCode::new(music.clone()))
-            .tool(SubmitMusicLoginCode::new(music.clone()))
-            .tool(PlayMusicQuery::new(music.clone()))
-            .tool(AddMusicToQueue::new(music.clone()))
-            .tool(AddRandomMusicToQueue::new(music.clone()))
-            .tool(PlayRandomMusic::new(music.clone()))
-            .tool(StopMusicPlayback::new(music.clone()))
-            .tool(PauseMusicPlayback::new(music.clone()))
-            .tool(ResumeMusicPlayback::new(music.clone()))
-            .tool(PlayNextMusic::new(music.clone()))
-            .tool(PlayPreviousMusic::new(music.clone()))
-            .tool(GetMusicStatus::new(music))
-            .run();
+        let mut tool_server = ToolServer::new();
+        if config.agent.tools_enabled {
+            tool_server = tool_server
+                .tool(GetCurrentTime::new(config.clone()))
+                .tool(GetWeather::new(config.clone()))
+                .tool(WebSearch::new(config.clone()))
+                .tool(EndConversation::new(control.clone()))
+                .tool(SearchMusic::new(music.clone()))
+                .tool(RequestMusicLoginCode::new(music.clone()))
+                .tool(SubmitMusicLoginCode::new(music.clone()))
+                .tool(PlayMusicQuery::new(music.clone()))
+                .tool(AddMusicToQueue::new(music.clone()))
+                .tool(AddRandomMusicToQueue::new(music.clone()))
+                .tool(PlayRandomMusic::new(music.clone()))
+                .tool(StopMusicPlayback::new(music.clone()))
+                .tool(PauseMusicPlayback::new(music.clone()))
+                .tool(ResumeMusicPlayback::new(music.clone()))
+                .tool(PlayNextMusic::new(music.clone()))
+                .tool(PlayPreviousMusic::new(music.clone()))
+                .tool(GetMusicStatus::new(music));
+        } else {
+            let _ = &music; // 未启用工具时保持变量被使用
+        }
+        let tool_server = tool_server.run();
 
-        let mcp = McpConnections::connect(config.clone(), tool_server.clone()).await;
+        let mcp = if config.agent.tools_enabled {
+            McpConnections::connect(config.clone(), tool_server.clone()).await
+        } else {
+            McpConnections::empty()
+        };
         if let Err(err) = device.stop_audio().await {
             warn!("initial stop_audio failed, continuing: {err:?}");
         }

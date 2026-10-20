@@ -28,6 +28,13 @@ pub struct McpConnections {
 }
 
 impl McpConnections {
+    /// 空实现：未启用工具时使用，避免无谓的连接与阻塞。
+    pub fn empty() -> Self {
+        Self {
+            supervisors: Vec::new(),
+        }
+    }
+
     pub async fn connect(config: Arc<AppConfig>, tool_server: ToolServerHandle) -> Self {
         let mut supervisors = Vec::new();
 

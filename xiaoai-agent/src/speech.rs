@@ -384,7 +384,12 @@ async fn handle_upward(
                             debug!(id = stream.id, "speech stream consumer closed");
                         }
                         Err(TrySendError::Full(_)) => {
-                            bail!("speech audio queue overflow on turn {}", stream.id);
+                            // 丢一帧音频，绝不把"队列满"升级成进程退出：
+                            // 消费端短暂卡顿会让整机重启，用户表现为"说着话突然没反应"。
+                            warn!(
+                                id = stream.id,
+                                "speech audio queue full, dropping incoming frame"
+                            );
                         }
                     }
                 }

@@ -314,6 +314,11 @@ pub struct AgentConfig {
     pub timezone: String,
     pub weather: WeatherConfig,
     pub web_search: WebSearchConfig,
+    /// 是否向 LLM 注册工具（内置 + MCP）。
+    /// 某些 OpenAI 兼容代理会丢弃 tool_calls 内容，表现为
+    /// "Response contained no message or tool call (empty)"；
+    /// 这类端点必须关掉工具才能正常对话。
+    pub tools_enabled: bool,
 }
 
 impl Default for AgentConfig {
@@ -322,6 +327,7 @@ impl Default for AgentConfig {
             timezone: "Asia/Shanghai".to_string(),
             weather: WeatherConfig::default(),
             web_search: WebSearchConfig::default(),
+            tools_enabled: true,
         }
     }
 }
@@ -576,7 +582,14 @@ impl Default for NavidromeConfig {
 
 pub fn openai_base_url(raw: &str) -> String {
     let base = raw.trim_end_matches('/');
-    if base.ends_with("/v1") {
+    // 只有在 URL 没有路径段时才补 /v1。
+    // 例如 https://ark.cn-beijing.volces.com/api/v3 已有路径，硬补会变成
+    // /api/v3/v1 → 404，且用户没有任何办法关掉。
+    let has_path = base
+        .split_once("://")
+        .map(|(_, rest)| rest.contains('/'))
+        .unwrap_or(false);
+    if base.ends_with("/v1") || has_path {
         base.to_string()
     } else {
         format!("{base}/v1")
