@@ -588,16 +588,19 @@ impl Default for NavidromeConfig {
     }
 }
 
+/// URL 是否已带路径段（`https://host` 为 false，`https://host/api/v3` 为 true）。
+fn url_has_path(base: &str) -> bool {
+    base.split_once("://")
+        .map(|(_, rest)| rest.contains('/'))
+        .unwrap_or(false)
+}
+
 pub fn openai_base_url(raw: &str) -> String {
     let base = raw.trim_end_matches('/');
     // 只有在 URL 没有路径段时才补 /v1。
     // 例如 https://ark.cn-beijing.volces.com/api/v3 已有路径，硬补会变成
     // /api/v3/v1 → 404，且用户没有任何办法关掉。
-    let has_path = base
-        .split_once("://")
-        .map(|(_, rest)| rest.contains('/'))
-        .unwrap_or(false);
-    if base.ends_with("/v1") || has_path {
+    if base.is_empty() || base.ends_with("/v1") || url_has_path(base) {
         base.to_string()
     } else {
         format!("{base}/v1")
@@ -605,8 +608,11 @@ pub fn openai_base_url(raw: &str) -> String {
 }
 
 pub fn openai_realtime_base_url(raw: &str) -> String {
+    // 与 openai_base_url 同一契约：带路径就原样用，不再强补 /v1
+    // （否则 https://host/api/v3 → /api/v3/v1、https://host/v1beta → /v1beta/v1）。
     let base = raw.trim_end_matches('/');
-    if base.ends_with("/v1") || base.ends_with("/realtime") {
+    if base.is_empty() || base.ends_with("/v1") || base.ends_with("/realtime") || url_has_path(base)
+    {
         base.to_string()
     } else {
         format!("{base}/v1")
@@ -639,8 +645,8 @@ fn resolve_optional_path(root: &Path, path: &mut Option<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        openai_base_url, AppConfig, AsrConfig, AsrProvider, LlmConfig, LlmProtocol, LlmThinkingMode,
-        McpConfig,
+        openai_base_url, openai_realtime_base_url, AppConfig, AsrConfig, AsrProvider, LlmConfig,
+        LlmProtocol, LlmThinkingMode, McpConfig,
     };
 
     #[test]
@@ -709,6 +715,34 @@ mod tests {
         assert_eq!(
             openai_base_url("http://192.168.1.106:8088/v1"),
             "http://192.168.1.106:8088/v1"
+        );
+    }
+
+    #[test]
+    fn openai_realtime_base_url_keeps_existing_path() {
+        assert_eq!(
+            openai_realtime_base_url("https://ark.cn-beijing.volces.com/api/v3"),
+            "https://ark.cn-beijing.volces.com/api/v3"
+        );
+        assert_eq!(
+            openai_realtime_base_url("https://api.example.com/v1beta"),
+            "https://api.example.com/v1beta"
+        );
+        assert_eq!(
+            openai_realtime_base_url("ws://192.168.1.10:8000/v1"),
+            "ws://192.168.1.10:8000/v1"
+        );
+        assert_eq!(
+            openai_realtime_base_url("http://192.168.1.10:8000/realtime"),
+            "http://192.168.1.10:8000/realtime"
+        );
+    }
+
+    #[test]
+    fn openai_realtime_base_url_appends_v1_for_bare_host() {
+        assert_eq!(
+            openai_realtime_base_url("http://192.168.1.10:8000"),
+            "http://192.168.1.10:8000/v1"
         );
     }
 

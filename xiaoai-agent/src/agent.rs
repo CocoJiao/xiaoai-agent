@@ -251,13 +251,27 @@ impl AgentRuntime {
         http_client: reqwest::Client,
         prompt: String,
     ) -> anyhow::Result<String> {
+        // 老版 Claude 要求 1024 <= budget_tokens < max_tokens；默认配置是
+        // budget 1024 / max_tokens 300，直接开 thinking 会每轮失败并播"大模型服务遇到问题"。
+        // 这里改成自动收敛并告警，不让纯配置陷阱把音箱弄哑。
+        let mut thinking_params = anthropic_thinking_params(
+            &self.config.llm.thinking.mode,
+            self.config.llm.thinking.budget_tokens,
+        );
         if self.config.llm.thinking.mode == LlmThinkingMode::Enabled {
-            anyhow::ensure!(
-                self.config.llm.thinking.budget_tokens < self.config.llm.max_tokens,
-                "llm.thinking.budget_tokens ({}) must be lower than llm.max_tokens ({})",
-                self.config.llm.thinking.budget_tokens,
-                self.config.llm.max_tokens
-            );
+            let max = self.config.llm.max_tokens;
+            let wanted = self.config.llm.thinking.budget_tokens;
+            if wanted >= max || wanted < 1024 {
+                let clamped = (max / 2).clamp(256, max.saturating_sub(1).max(256));
+                warn!(
+                    wanted,
+                    max_tokens = max,
+                    clamped,
+                    "llm.thinking.budget_tokens out of range, clamped automatically"
+                );
+                thinking_params =
+                    anthropic_thinking_params(&LlmThinkingMode::Enabled, clamped);
+            }
         }
 
         let client = anthropic::Client::builder()
@@ -273,10 +287,7 @@ impl AgentRuntime {
             .preamble(self.preamble())
             .max_tokens(self.config.llm.max_tokens)
             .default_max_turns(3)
-            .additional_params(anthropic_thinking_params(
-                &self.config.llm.thinking.mode,
-                self.config.llm.thinking.budget_tokens,
-            ));
+            .additional_params(thinking_params);
         if self.config.llm.thinking.mode != LlmThinkingMode::Enabled {
             builder = builder.temperature(self.config.llm.temperature);
         }
@@ -318,23 +329,19 @@ impl AgentRuntime {
 
 fn openai_thinking_params(mode: &LlmThinkingMode) -> Value {
     match mode {
-        LlmThinkingMode::Auto => json!({}),
-        LlmThinkingMode::Disabled => json!({
-            "reasoning_effort": "low",
-            "enable_thinking": false,
-            "chat_template_kwargs": {"enable_thinking": false}
-        }),
-        LlmThinkingMode::Enabled => json!({
-            "enable_thinking": true,
-            "chat_template_kwargs": {"enable_thinking": true}
-        }),
+        // Auto / Disabled 都不发参数：reasoning_effort、enable_thinking、
+        // chat_template_kwargs 都是特定厂商（OpenAI 推理模型 / Qwen 系）的方言，
+        // 换成严格代理或其它模型时会被 400 拒绝。需要时请用 llm.extra_params 显式传。
+        LlmThinkingMode::Auto | LlmThinkingMode::Disabled => json!({}),
+        LlmThinkingMode::Enabled => json!({ "enable_thinking": true }),
     }
 }
 
 fn anthropic_thinking_params(mode: &LlmThinkingMode, budget_tokens: u64) -> Value {
     match mode {
-        LlmThinkingMode::Auto => json!({}),
-        LlmThinkingMode::Disabled => json!({"thinking": {"type": "disabled"}}),
+        // 新版 Claude 已移除 budget_tokens，连 {"type":"disabled"} 都会 400；
+        // 默认什么都不发，代际通吃。
+        LlmThinkingMode::Auto | LlmThinkingMode::Disabled => json!({}),
         LlmThinkingMode::Enabled => {
             json!({"thinking": {"type": "enabled", "budget_tokens": budget_tokens}})
         }
@@ -349,9 +356,14 @@ mod tests {
 
     #[test]
     fn disables_thinking_for_anthropic_messages() {
+        // 默认不发任何 thinking 参数：新版 Claude 连 {"type":"disabled"} 都会 400
         assert_eq!(
             anthropic_thinking_params(&LlmThinkingMode::Disabled, 1024),
-            json!({"thinking": {"type": "disabled"}})
+            json!({})
+        );
+        assert_eq!(
+            anthropic_thinking_params(&LlmThinkingMode::Auto, 1024),
+            json!({})
         );
     }
 
@@ -364,9 +376,16 @@ mod tests {
     }
 
     #[test]
-    fn disables_thinking_for_openai_chat() {
-        let params = openai_thinking_params(&LlmThinkingMode::Disabled);
-        assert_eq!(params["enable_thinking"], false);
-        assert_eq!(params["chat_template_kwargs"]["enable_thinking"], false);
+    fn omits_vendor_specific_params_by_default() {
+        // reasoning_effort / chat_template_kwargs 是厂商方言，默认不能发
+        assert_eq!(
+            openai_thinking_params(&LlmThinkingMode::Disabled),
+            json!({})
+        );
+        assert_eq!(openai_thinking_params(&LlmThinkingMode::Auto), json!({}));
+        assert_eq!(
+            openai_thinking_params(&LlmThinkingMode::Enabled),
+            json!({"enable_thinking": true})
+        );
     }
 }

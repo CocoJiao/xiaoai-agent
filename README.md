@@ -104,6 +104,10 @@ cp xiaoai-agent/agent.example.yaml xiaoai-agent/agent.yaml
   `asr.openai_realtime.server_vad.enabled` 设为 `false`，退回本地 energy 端点检测
 - `llm.protocol`、`llm.base_url`、`llm.api_key`、`llm.model`：大模型服务配置。
   `base_url` 已带路径（如 `/v1`、`/api/v3`）时原样使用，**不再自动补 `/v1`**。
+  `protocol` 可选 `open_ai_chat` 或 `anthropic`；Anthropic-compatible 服务可通过
+  `thinking.mode` 控制推理。默认不发任何厂商私有参数（`reasoning_effort`、
+  `enable_thinking`、`thinking.type`），换模型/换代理不会因为方言参数被拒；
+  只有 `thinking.mode: enabled` 才显式发送，`budget_tokens` 越界会自动收敛并告警。
 - `agent.tools_enabled`（默认 `true`）：是否向大模型注册工具（内置 + MCP）。
   后端是"不支持 tools API"的兼容代理（表现为带工具时返回空的 tool_calls）时设为 `false`，
   此时会改用不含工具指令的 preamble，模型不会声称执行了动作；`end_conversation`
@@ -113,8 +117,6 @@ cp xiaoai-agent/agent.example.yaml xiaoai-agent/agent.yaml
   工具返回带时区/星期的结构化结果。
 - `device.command_timeout_s`（默认 `30`）：单条设备命令的最长执行时间。
   系统 TTS 是同步播放，长回复可能需要 50~80 秒，建议按需调到 `60`。
-  `protocol` 可选 `open_ai_chat` 或 `anthropic`；Anthropic-compatible 服务可通过
-  `thinking.mode` 控制推理。
 - `mcp.servers`：通用 MCP server 列表；每个 server 可独立配置 URL、token、timeout 和工具 allowlist
 - `music`：音乐服务配置，推荐使用 Navidrome；不需要音乐功能时保持 `music.enabled: false`
 - `runtime` / `capture`：唤醒和录音参数，通常先使用示例值
