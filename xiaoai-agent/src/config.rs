@@ -638,7 +638,8 @@ fn resolve_optional_path(root: &Path, path: &mut Option<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, AsrConfig, AsrProvider, LlmConfig, LlmProtocol, LlmThinkingMode, McpConfig,
+        openai_base_url, AppConfig, AsrConfig, AsrProvider, LlmConfig, LlmProtocol, LlmThinkingMode,
+        McpConfig,
     };
 
     #[test]
