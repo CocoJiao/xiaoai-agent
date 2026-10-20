@@ -55,6 +55,7 @@ jobs:
         run: cargo +"$RUST_TOOLCHAIN" check --locked --bin xiaoai-agent
 
       - name: Test
+        working-directory: ${{ env.AGENT_DIR }}
         run: cargo +"$RUST_TOOLCHAIN" test --locked --bin xiaoai-agent
 
       - name: Build release binary
