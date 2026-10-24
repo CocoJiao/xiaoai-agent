@@ -1,5 +1,6 @@
 use anyhow::Context;
 use base64::Engine;
+use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use reqwest::multipart::{Form, Part};
 use reqwest::Client;
@@ -174,7 +175,7 @@ impl OpenAiRealtimeAsr {
     ) -> anyhow::Result<String> {
         let session = self.start_streaming_session(sample_rate).await?;
         let appender = session.appender();
-        appender.append_pcm(pcm.to_vec()).await?;
+        appender.append_pcm(Bytes::copy_from_slice(pcm)).await?;
         session.commit_and_transcribe().await
     }
 
@@ -330,7 +331,7 @@ pub struct RealtimeAsrAppender {
 }
 
 impl RealtimeAsrAppender {
-    pub async fn append_pcm(&self, pcm: Vec<u8>) -> anyhow::Result<()> {
+    pub async fn append_pcm(&self, pcm: Bytes) -> anyhow::Result<()> {
         let audio = resample_pcm16_mono_linear(&pcm, self.sample_rate, self.target_sample_rate)?;
         if audio.is_empty() {
             return Ok(());
