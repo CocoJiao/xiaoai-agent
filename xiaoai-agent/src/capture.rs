@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use std::future::Future;
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ pub async fn record_utterance<F, Fut>(
     idle_timeout: Duration,
     turn: &mut SpeechTurn,
     on_speech_start: F,
-) -> anyhow::Result<Vec<u8>>
+) -> anyhow::Result<Bytes>
 where
     F: Fn() -> Fut + Send + Sync,
     Fut: Future<Output = ()> + Send,
@@ -77,11 +78,11 @@ pub async fn record_utterance_streaming<F, Fut, C, CFut, R, RFut>(
     on_speech_start: F,
     on_audio_chunk: C,
     on_speech_rejected: R,
-) -> anyhow::Result<Vec<u8>>
+) -> anyhow::Result<Bytes>
 where
     F: Fn() -> Fut + Send + Sync,
     Fut: Future<Output = ()> + Send,
-    C: Fn(Vec<u8>) -> CFut + Send + Sync,
+    C: Fn(Bytes) -> CFut + Send + Sync,
     CFut: Future<Output = anyhow::Result<()>> + Send,
     R: Fn() -> RFut + Send + Sync,
     RFut: Future<Output = anyhow::Result<()>> + Send,

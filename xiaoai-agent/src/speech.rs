@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, bail, Context};
+use bytes::Bytes;
 use rand::RngCore;
 use tokio::net::UnixDatagram;
 use tokio::sync::mpsc::error::TrySendError;
@@ -74,7 +75,9 @@ impl ActivationMode {
 
 #[derive(Debug)]
 pub enum SpeechInput {
-    Pcm(Vec<u8>),
+    /// PCM 载荷用引用计数缓冲：麦克风每秒约 31 个包，VAD 里同一块数据会被
+    /// 队列、pre-roll 窗口、utterance 累积缓冲多处引用，`Vec` 每次都要深拷贝。
+    Pcm(Bytes),
     End,
     Cancelled,
 }
@@ -379,7 +382,10 @@ async fn handle_upward(
         UP_STREAM_TRANSMITTING => {
             if event.transmit_type == Some(STREAM_ASR) {
                 if let Some(stream) = &state.current {
-                    match stream.input_tx.try_send(SpeechInput::Pcm(event.data)) {
+                    match stream
+                        .input_tx
+                        .try_send(SpeechInput::Pcm(Bytes::from(event.data)))
+                    {
                         Ok(()) => {}
                         Err(TrySendError::Closed(_)) => {
                             debug!(id = stream.id, "speech stream consumer closed");
@@ -890,7 +896,9 @@ mod tests {
             .send_to(&transmitting(STREAM_ASR, &[1, 2, 3, 4]), &server_path)
             .await
             .unwrap();
-        assert!(matches!(turn.recv().await, Some(SpeechInput::Pcm(data)) if data == [1, 2, 3, 4]));
+        assert!(
+            matches!(turn.recv().await, Some(SpeechInput::Pcm(data)) if data.as_ref() == [1, 2, 3, 4])
+        );
 
         turn.stop_capture().await.unwrap();
         assert_eq!(recv_downward(&client).await.0, DOWN_STOP_CAPTURE);

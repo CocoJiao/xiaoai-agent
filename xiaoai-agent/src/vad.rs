@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use bytes::{Bytes, BytesMut};
 use tracing::{debug, info};
 
 use crate::config::CaptureConfig;
@@ -8,10 +9,10 @@ use crate::config::CaptureConfig;
 pub const BYTES_PER_SAMPLE: usize = 2;
 
 pub enum SpeechEvent {
-    SpeechStart(Vec<u8>),
-    SpeechChunk(Vec<u8>),
+    SpeechStart(Bytes),
+    SpeechChunk(Bytes),
     SpeechRejected,
-    Utterance(Vec<u8>),
+    Utterance(Bytes),
 }
 
 pub struct SpeechCollector {
@@ -25,9 +26,9 @@ pub struct SpeechCollector {
     max_utterance_ms: u64,
     cooldown: Duration,
     print_levels: bool,
-    pending: Vec<u8>,
-    pre_roll: VecDeque<Vec<u8>>,
-    utterance: Vec<u8>,
+    pending: BytesMut,
+    pre_roll: VecDeque<Bytes>,
+    utterance: BytesMut,
     in_speech: bool,
     voiced_ms: u64,
     silence_run_ms: u64,
@@ -54,9 +55,9 @@ impl SpeechCollector {
             max_utterance_ms: (config.max_utterance_s.max(1.0) * 1000.0) as u64,
             cooldown: Duration::from_secs_f64(config.cooldown_s.max(0.0)),
             print_levels: config.print_levels,
-            pending: Vec::new(),
+            pending: BytesMut::new(),
             pre_roll: VecDeque::new(),
-            utterance: Vec::new(),
+            utterance: BytesMut::new(),
             in_speech: false,
             voiced_ms: 0,
             silence_run_ms: 0,
@@ -71,7 +72,10 @@ impl SpeechCollector {
         let mut events = Vec::new();
         self.pending.extend_from_slice(bytes);
         while self.pending.len() >= self.block_bytes {
-            let block = self.pending.drain(..self.block_bytes).collect::<Vec<_>>();
+            // split_to 只切边界、不复制数据；push_block 里再 freeze 成 Bytes，
+            // 之后 pre_roll / utterance 共享同一块内存（每秒约 31 个包，原来
+            // 每块都要 drain 复制一次 + pre_roll clone 一次）。
+            let block = self.pending.split_to(self.block_bytes);
             events.extend(self.push_block(block));
         }
         events
@@ -81,7 +85,7 @@ impl SpeechCollector {
         self.log_noise_floor_with_trigger(reason, None);
     }
 
-    fn push_block(&mut self, mut block: Vec<u8>) -> Vec<SpeechEvent> {
+    fn push_block(&mut self, mut block: BytesMut) -> Vec<SpeechEvent> {
         if let Some(last_completed) = self.last_completed {
             if !self.in_speech && last_completed.elapsed() < self.cooldown {
                 return Vec::new();
@@ -97,6 +101,10 @@ impl SpeechCollector {
         let block_ms =
             (block.len() as u64 * 1000) / (self.sample_rate as u64 * BYTES_PER_SAMPLE as u64);
         let is_voice = level >= self.threshold;
+
+        // 增益与电平算完就冻结：后面的 pre_roll / utterance 只需要只读共享，
+        // Bytes::clone 是引用计数，不再复制音频数据。
+        let block = block.freeze();
 
         if !self.in_speech {
             if !is_voice {
@@ -117,7 +125,10 @@ impl SpeechCollector {
                 self.utterance_ms = block_ms * self.pre_roll.len() as u64;
                 self.log_noise_floor_with_trigger("speech_start", Some(level));
                 debug!("CAPTURE_SPEECH_START level={level:.5}");
-                return vec![SpeechEvent::SpeechStart(self.utterance.clone())];
+                // split() 把已累积的 pre-roll 整段取走（O(1)），不留引用；
+                // 后续块继续往同一个 BytesMut 里追加。
+                let prefix = self.utterance.split().freeze();
+                return vec![SpeechEvent::SpeechStart(prefix)];
             }
             return Vec::new();
         }
@@ -136,7 +147,7 @@ impl SpeechCollector {
         }
 
         let final_chunk = block;
-        let utterance = std::mem::take(&mut self.utterance);
+        let utterance = self.utterance.split().freeze();
         let duration_s =
             utterance.len() as f64 / (self.sample_rate as f64 * BYTES_PER_SAMPLE as f64);
         let peak = peak_norm(&utterance);
