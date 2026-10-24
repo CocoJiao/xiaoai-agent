@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - main
+      # 集成分支：合并动作本身也要有 CI。否则「每个 PR 各自绿」不等于
+      # 「合并后整体绿」——语义冲突只在合并后才会暴露。
+      - "integration/**"
     tags:
       - "v*"
     paths:
