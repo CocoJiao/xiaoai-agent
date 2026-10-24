@@ -118,6 +118,62 @@ impl SpeechTurn {
     }
 }
 
+/// 测试用的行为记录：把 `SpeechHandle` 发出的命令翻译成可断言的枚举。
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TestCommand {
+    StopCapture,
+    Finish { continue_dialog: bool },
+}
+
+#[cfg(test)]
+impl SpeechTurn {
+    /// 造一个 channel-backed 的 turn，并自动应答命令通道。
+    ///
+    /// `SpeechTurn` 本来就是全 channel-backed 的（输入是 `mpsc::Receiver<SpeechInput>`，
+    /// 命令走 `SpeechHandle` 里的 `mpsc::Sender<ServiceCommand>`），所以测它**不需要**
+    /// 抽 trait：把两端暴露出来，测试就能
+    /// - 送 `SpeechInput::{Pcm, End, Cancelled}` 驱动 capture.rs 的各条路径；
+    /// - 读命令记录，断言 `stop_capture` / `finish_dialog` / `continue_dialog`
+    ///   到底有没有真的发出去（这是「清理路径」唯一可观测的证据）。
+    ///
+    /// 注意：命令必须被**应答**，`SpeechHandle::send` 在等 oneshot，
+    /// 只收不回会把被测函数永久挂住——所以这里起了一个常驻应答任务。
+    pub fn for_test(
+        id: u64,
+    ) -> (
+        Self,
+        mpsc::Sender<SpeechInput>,
+        std::sync::Arc<tokio::sync::Mutex<Vec<TestCommand>>>,
+    ) {
+        let (input_tx, input_rx) = mpsc::channel(64);
+        let (command_tx, mut command_rx) = mpsc::channel::<ServiceCommand>(16);
+        let recorded = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let sink = recorded.clone();
+        tokio::spawn(async move {
+            while let Some(command) = command_rx.recv().await {
+                let recorded_kind = match command.kind {
+                    CommandKind::StopCapture => TestCommand::StopCapture,
+                    CommandKind::Finish { continue_dialog } => {
+                        TestCommand::Finish { continue_dialog }
+                    }
+                };
+                sink.lock().await.push(recorded_kind);
+                let _ = command.result_tx.send(Ok(()));
+            }
+        });
+        let turn = Self {
+            id,
+            activation: ActivationMode::Wakeup,
+            interaction_mode: 0,
+            input_rx,
+            handle: SpeechHandle { command_tx },
+            stop_requested: false,
+        };
+        (turn, input_tx, recorded)
+    }
+}
+
 pub struct SpeechService {
     handle: SpeechHandle,
     event_rx: mpsc::Receiver<SpeechServiceEvent>,
