@@ -244,20 +244,20 @@ async fn main() -> anyhow::Result<()> {
                     }
                     let streak = failures.load(Ordering::Relaxed);
                     if streak >= YIELD_AFTER_CONSECUTIVE_FAILURES {
-                        // 「能唤醒但答不上」已经连续出现整段会话。继续留在接管
-                        // 状态只会让用户一直对着一个不说话的音箱喊，让位更划算。
                         error!(
                             consecutive_failures = streak,
                             "连续多轮会话失败，故障让位给原厂小爱"
                         );
-                        let outcome = yield_to_native(
+                        if let Some(code) = yield_after_consecutive_failures(
                             &device,
                             launcher.as_deref(),
                             &ownership,
-                            "consecutive failures",
+                            &failures,
                         )
-                        .await;
-                        std::process::exit(if outcome.succeeded() { 0 } else { 1 });
+                        .await
+                        {
+                            std::process::exit(code);
+                        }
                     }
                     device
                         .blink_ready(initial.device.led_listening, Duration::from_millis(250))
@@ -494,6 +494,35 @@ impl Drop for ReloadGuard {
     fn drop(&mut self) {
         self.0.release();
     }
+}
+
+/// 连续失败达到阈值后的处置：让位成功就退出，**没成功就继续跑**。
+///
+/// 这是「让位失败后的存活策略」里选的那一档（C-lite）：
+///
+/// - `Fatal` / 事件通道关闭 = 语音服务已经死了，留着也没用 → 让位后一律退出；
+/// - 连续会话失败 = 服务**还活着**（只是答不上来），此时退出会留下
+///   「哑 + watchdog 已被 stop_watchdog 停掉」的状态，比继续撑着更糟。
+///   所以让位没成功就把失败计数清零、继续服务，等下一次攒够再试。
+///
+/// 不做「立刻重试让位」：重试会再调一次 `start-agent.sh stop`，而它用 `mkdir`
+/// 锁和 watchdog 互斥；第一次因为「杀不掉 agent」失败的话第二次大概率同因失败，
+/// 结果是反复 stop/start 原生服务，比不动更糟。
+///
+/// 返回 `Some(退出码)` = 调用方应当退出；`None` = 继续跑。
+async fn yield_after_consecutive_failures(
+    device: &Device,
+    launcher: Option<&Path>,
+    ownership: &SocketOwnership,
+    failures: &Arc<AtomicU32>,
+) -> Option<i32> {
+    let outcome = yield_to_native(device, launcher, ownership, "consecutive failures").await;
+    if outcome.succeeded() {
+        return Some(0);
+    }
+    warn!("故障让位未成功，继续运行；连续失败计数已清零，攒够再试");
+    failures.store(0, Ordering::Relaxed);
+    None
 }
 
 /// 把一次重载丢到后台跑。
@@ -1387,6 +1416,56 @@ mod tests {
         assert!(outcome.issued);
         assert!(!outcome.taken_over);
         assert!(outcome.succeeded(), "命令成功就算让位达成");
+        let _ = std::fs::remove_file(owned.path());
+    }
+
+    /// 连续失败后的处置：让位成功 → 退出；让位失败 → 继续跑（C-lite 策略）。
+    #[tokio::test]
+    async fn consecutive_failures_exit_only_when_the_yield_succeeded() {
+        let shell = Arc::new(RecordingShell::always_ok());
+        let device = Device::with_runner(DeviceConfig::default(), shell);
+        let failures = Arc::new(AtomicU32::new(YIELD_AFTER_CONSECUTIVE_FAILURES));
+        let owned = still_owned_socket("streak-exit");
+
+        let code = yield_after_consecutive_failures(
+            &device,
+            Some(Path::new("/data/open-xiaoai/start-agent.sh")),
+            &owned,
+            &failures,
+        )
+        .await;
+
+        assert_eq!(code, Some(0), "让位成功才退出");
+        let _ = std::fs::remove_file(owned.path());
+    }
+
+    #[tokio::test]
+    async fn consecutive_failures_keep_running_when_the_yield_failed() {
+        let shell = Arc::new(RecordingShell::exiting_with(
+            1,
+            "another launcher operation is in progress",
+        ));
+        let device = Device::with_runner(DeviceConfig::default(), shell);
+        let failures = Arc::new(AtomicU32::new(YIELD_AFTER_CONSECUTIVE_FAILURES));
+        let owned = still_owned_socket("streak-keep");
+
+        let code = yield_after_consecutive_failures(
+            &device,
+            Some(Path::new("/data/open-xiaoai/start-agent.sh")),
+            &owned,
+            &failures,
+        )
+        .await;
+
+        assert_eq!(
+            code, None,
+            "让位失败时不能退出：退出会留下「哑 + watchdog 已停」"
+        );
+        assert_eq!(
+            failures.load(Ordering::Relaxed),
+            0,
+            "计数必须清零，否则每个 tick 都会再试一次让位"
+        );
         let _ = std::fs::remove_file(owned.path());
     }
 
