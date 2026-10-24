@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
         started_at: std::time::Instant::now(),
         config_path: Some(cli.config.clone()),
     });
-    let _control_task = server::spawn(&initial.server, control_state).await?;
+    let _control_task = start_control_plane(&initial.server, control_state).await;
 
     let device = Device::new(initial.device.clone());
     let asr = AsrClient::new(initial.asr.clone())?;
@@ -441,7 +441,9 @@ fn keep_pending_sections(
             // 这条分支以前只 warn、不回填，等于「没保留旧值」：新段的字段会原样
             // 进句柄，而实际跑着的还是旧配置。server.token 一旦这样漏掉，日志说
             // 「已热加载」但监听器用的还是旧 token —— 安全相关的显示与实际不符。
-            other => warn!(
+            // 「句柄即将说谎」比一条普通告警严重：下次有人加新段忘了登记时，
+            // 这条要在日志里显眼跳出来（在 server.token 上它意味着「显示的与实际用的不是一回事」）。
+            other => error!(
                 section = other,
                 "未知的待生效配置段：没有回填逻辑，句柄里会是新值（与实际运行值不一致）"
             ),
@@ -578,6 +580,24 @@ async fn yield_after_consecutive_failures(
         );
     }
     Some(1)
+}
+
+/// 起控制面。**失败不返回 Err**：配置错误只该废掉控制面，不该废掉音箱。
+///
+/// 如果这里用 `?`，进程会退出 → watchdog 重启 → 因为同一个配置错误再退出，
+/// 变成每 5 秒一次的失败重启循环，语音功能一起没了，只能人工改配置恢复。
+/// 安全上没有损失：「不启动控制面」意味着那个端口压根没被监听。
+async fn start_control_plane(
+    config: &crate::config::ServerConfig,
+    state: Arc<server::ControlState>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    match server::spawn(config, state).await {
+        Ok(task) => task,
+        Err(err) => {
+            error!("控制面启动失败（语音功能不受影响）: {err:#}");
+            None
+        }
+    }
 }
 
 /// 把一次重载丢到后台跑。
@@ -1599,6 +1619,33 @@ mod tests {
             "inode 换了但原生服务没起来，不能算成功（退出码 0 = 哑且无任何信号）"
         );
         let _ = std::fs::remove_file(taken.path());
+    }
+
+    /// 配置写错只该废掉控制面：返回 None（= 没有监听任务），不是 panic / Err。
+    /// 这条钉住的是「故障半径」这个决定本身。
+    #[tokio::test]
+    async fn a_misconfigured_control_plane_does_not_take_the_agent_down() {
+        use crate::config::ServerConfig;
+        use crate::speech::{SocketOwnership, SpeechLiveness};
+
+        let config = ServerConfig {
+            enabled: true,
+            host: "0.0.0.0".to_string(), // 非回环
+            port: 0,
+            token: String::new(), // 没有 token → spawn 会拒绝
+        };
+        let state = Arc::new(crate::server::ControlState {
+            token: String::new(),
+            socket: SocketOwnership::unattributed(std::env::temp_dir().join("xiaoai-not-there")),
+            liveness: SpeechLiveness::default(),
+            started_at: std::time::Instant::now(),
+            config_path: None,
+        });
+
+        assert!(
+            start_control_plane(&config, state).await.is_none(),
+            "控制面起不来应当返回 None 而不是让调用方退出"
+        );
     }
 
     /// `succeeded()` 是「让位是否达成」的唯一答案：`exit 5` 必须压过 inode 事实。

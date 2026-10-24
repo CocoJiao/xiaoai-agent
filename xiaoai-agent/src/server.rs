@@ -37,6 +37,14 @@ pub async fn spawn(
         return Ok(None);
     }
 
+    // 决定不启动，就别先把端口占了：检查放在 bind 之前。
+    if config.token.trim().is_empty() && !is_loopback(&config.host) {
+        return Err(anyhow::anyhow!(
+            "控制面绑在非回环地址（{}）却没有配置 token：拒绝启动。请设 server.token，或把 host 改回 127.0.0.1",
+            config.host
+        ));
+    }
+
     let addr = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -46,16 +54,6 @@ pub async fn spawn(
         .map(|addr| addr.to_string())
         .unwrap_or(addr);
 
-    // 边界要在暴露面还小的时候划：当前只有只读端点，但 #9 的下一步就是
-    // /play/*、/wakeup、/stop —— 那是能让音箱开口、能打断播放的端点。
-    // 「改 host 忘了填 token」是最常见的翻车方式，所以这里直接拒绝启动，
-    // 而不是打一条 warn 让它继续跑。
-    if config.token.trim().is_empty() && !is_loopback(&config.host) {
-        return Err(anyhow::anyhow!(
-            "控制面绑在非回环地址（{}）却没有配置 token：拒绝启动。请设 server.token，或把 host 改回 127.0.0.1",
-            config.host
-        ));
-    }
     info!(
         listen = %local,
         auth = !state.token.trim().is_empty(),
@@ -199,6 +197,11 @@ mod tests {
         })
     }
 
+    /// 临时占位文件要自己收：每次跑测试都留一个 `xiaoai-health-*` 的话，开发机会越攒越多。
+    fn cleanup(state: &Arc<ControlState>) {
+        let _ = std::fs::remove_file(state.socket.path());
+    }
+
     fn temp_sock(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("xiaoai-health-{}-{tag}.usock", std::process::id()))
     }
@@ -287,24 +290,31 @@ mod tests {
     #[test]
     fn health_is_ok_only_while_the_socket_is_still_ours() {
         let socket = still_owned_socket("healthy");
-        let (code, body) = health_response(&state_with_ownership("", socket));
+        let state = state_with_ownership("", socket);
+        let (code, body) = health_response(&state);
         assert_eq!(code, StatusCode::OK);
         assert_eq!(body["status"], "ok");
         assert_eq!(body["socket"]["owned"], true);
-        assert_eq!(
-            status_body(&state_with_ownership("t", unattributed()))["pid"],
-            std::process::id()
-        );
+        cleanup(&state);
+    }
+
+    /// `/status` 除了健康字段，还要给出排查用的 pid（与健康判据无关，单独一条）。
+    #[test]
+    fn status_reports_the_process_id() {
+        let state = state_with_ownership("t", unattributed());
+        assert_eq!(status_body(&state)["pid"], std::process::id());
     }
 
     /// 判据二：inode 换成了原生的（被让位/被抢回）→ 503。
     #[test]
     fn health_is_503_when_the_socket_was_taken_over() {
         let socket = taken_over_socket("taken");
-        let (code, body) = health_response(&state_with_ownership("", socket));
+        let state = state_with_ownership("", socket);
+        let (code, body) = health_response(&state);
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["status"], "socket_not_owned");
         assert_eq!(body["socket"]["owned"], false);
+        cleanup(&state);
     }
 
     /// 判据三（复核指出的那个洞）：**路径不存在**时不能算「还是我的」。
@@ -345,10 +355,12 @@ mod tests {
             port: 0,
             token: String::new(),
         };
-        assert!(spawn(&config, state_with_ownership("", unattributed()))
+        let handle = spawn(&config, state_with_ownership("", unattributed()))
             .await
             .unwrap()
-            .is_some());
+            .expect("回环 + 空 token 应当允许启动");
+        // JoinHandle 的 drop 不会取消任务，测试里必须自己 abort。
+        handle.abort();
     }
 
     #[test]
