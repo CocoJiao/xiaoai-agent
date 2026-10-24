@@ -126,6 +126,22 @@ cp xiaoai-agent/agent.example.yaml xiaoai-agent/agent.yaml
 - `runtime` / `capture`：唤醒和录音参数，通常先使用示例值
 - `airplay`：AirPlay 音频输出配置，默认关闭
 
+#### 改完配置不用重启：SIGHUP 热加载
+
+编辑 `agent.yaml` 后给 agent 发一个 `SIGHUP`，不必重启（也就不必重新接管语音链路）：
+
+```sh
+kill -HUP "$(cat /tmp/xiaoai-agent/xiaoai-agent.pid)"
+```
+
+生效范围：
+
+- **立即生效（下一轮对话开始用新值）**：`llm`、`agent`、`music`、`capture`、`runtime.session_idle_timeout_s`、`mcp`
+- **需要重启**：`device`（TTS 命令模板、命令超时、LED id）、`asr`、`airplay`。这几段在启动时就被各组件快照下来了，热加载只会在日志里告警「需重启」，实际沿用旧值——不会出现「模板还是旧命令、ID 是新值」这种半套配置
+- **拒绝**：`runtime.speech_socket`。运行中换 socket 会让 mipns 和 agent 各说各话，只告警不改
+
+配置文件写坏（YAML 语法错）时**保留旧配置继续跑**，只在日志里报错——一次误编辑不该让音箱变哑。热加载的具体分类见 [AGENTS.md](./AGENTS.md) 的 "Configuration Hot Reload"。
+
 #### Home Assistant MCP（推荐 HA-MCP）
 
 推荐使用 [homeassistant-ai/ha-mcp](https://github.com/homeassistant-ai/ha-mcp) 的
