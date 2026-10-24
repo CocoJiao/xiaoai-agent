@@ -35,7 +35,7 @@ use crate::capture::{
 use crate::config::{classify_config_change, AppConfig, ConfigChanges, ConfigHandle, DeviceConfig};
 use crate::device::Device;
 use crate::music::MusicService;
-use crate::speech::{SpeechHandle, SpeechService, SpeechServiceEvent, SpeechTurn};
+use crate::speech::{SocketOwnership, SpeechHandle, SpeechService, SpeechServiceEvent, SpeechTurn};
 
 const ASR_SERVICE_ERROR_PROMPT: &str = "抱歉，语音识别服务遇到问题，请稍后重试";
 const LLM_SERVICE_ERROR_PROMPT: &str = "抱歉，大模型服务遇到问题，请稍后重试";
@@ -64,6 +64,9 @@ async fn main() -> anyhow::Result<()> {
     let initial = config.get().await;
     let mut speech = SpeechService::bind(&initial.runtime.speech_socket).await?;
     let speech_handle = speech.handle();
+    // 让位判断用：我绑的是哪个 socket。让位脚本会把原生 socket mv 回同一路径，
+    // inode 随之改变——用它判断「到底有没有交出去」，比看退出码可靠。
+    let ownership = speech.ownership();
 
     let device = Device::new(initial.device.clone());
     let asr = AsrClient::new(initial.asr.clone())?;
@@ -94,13 +97,14 @@ async fn main() -> anyhow::Result<()> {
             event = speech.recv() => {
                 let Some(event) = event else {
                     // 服务任务自己结束了：和 Fatal 同一类故障，先让位再退出。
-                    let yielded = yield_to_native(
+                    let outcome = yield_to_native(
                         &device,
                         launcher.as_deref(),
+                        &ownership,
                         "speech.usock service stopped",
                     )
                     .await;
-                    std::process::exit(if yielded { 0 } else { 1 });
+                    std::process::exit(if outcome.succeeded() { 0 } else { 1 });
                 };
                 match event {
                     SpeechServiceEvent::Registered { vendor, codec } => {
@@ -133,10 +137,14 @@ async fn main() -> anyhow::Result<()> {
                             )
                             .await;
                         }
-                        let yielded =
-                            yield_to_native(&device, launcher.as_deref(), "speech.usock fatal")
-                                .await;
-                        std::process::exit(if yielded { 0 } else { 1 });
+                        let outcome = yield_to_native(
+                            &device,
+                            launcher.as_deref(),
+                            &ownership,
+                            "speech.usock fatal",
+                        )
+                        .await;
+                        std::process::exit(if outcome.succeeded() { 0 } else { 1 });
                     }
                     SpeechServiceEvent::Turn(turn) if turn.activation().is_wakeup() => {
                         info!(
@@ -242,10 +250,14 @@ async fn main() -> anyhow::Result<()> {
                             consecutive_failures = streak,
                             "连续多轮会话失败，故障让位给原厂小爱"
                         );
-                        let yielded =
-                            yield_to_native(&device, launcher.as_deref(), "consecutive failures")
-                                .await;
-                        std::process::exit(if yielded { 0 } else { 1 });
+                        let outcome = yield_to_native(
+                            &device,
+                            launcher.as_deref(),
+                            &ownership,
+                            "consecutive failures",
+                        )
+                        .await;
+                        std::process::exit(if outcome.succeeded() { 0 } else { 1 });
                     }
                     device
                         .blink_ready(initial.device.led_listening, Duration::from_millis(250))
@@ -603,13 +615,40 @@ fn launcher_path() -> Option<PathBuf> {
 /// 还有一条别动的细节：本进程被 SIGTERM 打死时不会跑析构，`SpeechService` 的
 /// Drop（它 `remove_file(socket_path)`）因此不会执行。这正是我们要的——脚本
 /// 已经把原生的 `speech.usock` 移回原位，跑析构会把刚还原好的原生 socket 删掉。
-async fn yield_to_native(device: &Device, launcher: Option<&Path>, reason: &str) -> bool {
+/// 一次让位尝试的结果。
+///
+/// 两个事实分开记：`issued` 是「命令跑成功了吗」，`taken_over` 是「麦克风真的
+/// 交出去了吗」。只看前者会误判——launcher 可能因为「杀不掉 agent」在收尾阶段
+/// 返回非 0，而原生前端早已恢复；调过来也一样，脚本成功但 socket 还在我们手里
+/// 就绝不能当成功。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct YieldOutcome {
+    issued: bool,
+    taken_over: bool,
+}
+
+impl YieldOutcome {
+    /// 让位是否达成：命令成功，或者事实上已经被接管走。
+    fn succeeded(&self) -> bool {
+        self.issued || self.taken_over
+    }
+}
+
+async fn yield_to_native(
+    device: &Device,
+    launcher: Option<&Path>,
+    ownership: &SocketOwnership,
+    reason: &str,
+) -> YieldOutcome {
     let Some(launcher) = launcher else {
         error!(
             reason,
             "找不到 start-agent.sh，无法让位；只能退出交给 watchdog 处理"
         );
-        return false;
+        return YieldOutcome {
+            issued: false,
+            taken_over: ownership.taken_over(),
+        };
     };
     let script = format!(
         "{} stop",
@@ -620,9 +659,9 @@ async fn yield_to_native(device: &Device, launcher: Option<&Path>, reason: &str)
         launcher = %launcher.display(),
         "故障让位：把麦克风还给原厂小爱"
     );
-    // 还原序列内部有多次 sleep（stop_pns 最多 5s、stop_mico 最多 10s、
-    // 重启原生服务再等 START_TIMEOUT），给足 180s，别在脚本干到一半时判超时。
-    match device.run_raw(&script, Duration::from_secs(180)).await {
+    // 走 detached 通道：还原序列必须能跑完。用普通通道的话，180s 超时会连带
+    // 杀掉正在 restore 的 /bin/sh，停在「保护已卸、原生 socket 还没 mv 回」的中间态。
+    let issued = match device.run_detached(&script, Duration::from_secs(180)).await {
         Ok(result) if result.exit_code == 0 => {
             info!("launcher stop 已执行，原厂前端应当已恢复");
             true
@@ -639,7 +678,34 @@ async fn yield_to_native(device: &Device, launcher: Option<&Path>, reason: &str)
             error!(error = %err, "让位命令没能执行");
             false
         }
+    };
+
+    let taken_over = ownership.taken_over();
+    // 注意：超时（`run_detached` 返回 Err）时脚本其实还在跑，这里是紧接着做的
+    // 一次瞬间快照，可能正好落在 restore_native_files 的 `rm -f` 与 `mv` 之间——
+    // 那种情况下 `taken_over()` 为 false（严格化后不再把「路径不存在」当接管），
+    // 于是判失败、退出码 1。方向上是刻意的：误报失败只是多查一次，误报成功会把
+    // 唯一的信号消灭掉。真机上若见到「明明恢复了却退出 1」，先看这里。
+    // 两种矛盾态都要留痕：它们正是「命令说的」和「事实」对不上的地方，
+    // 而 `succeeded()` 会把它们合成一个结论——不记录就再也看不见了。
+    if taken_over && !issued {
+        warn!(
+            socket = %ownership.path().display(),
+            "让位命令报失败，但 speech.usock 已被原生接管，按成功处理"
+        );
     }
+    if issued && !taken_over {
+        // 典型来源：restore_native_files 里 [ -e "$NATIVE_SPEECH_SOCKET" ] 为假时，
+        // 脚本既不 rm 也不 mv，一路返回 0——麦克风其实没交出去。
+        // 另外也可能是「不知道当初绑的是哪个 inode」，那种情况下结论同样存疑。
+        let detail = if ownership.still_owned() {
+            "让位命令报告成功，但 speech.usock 还是本进程绑的 inode：麦克风可能没交出去"
+        } else {
+            "让位命令报告成功，但无法确认 speech.usock 归属：让位结果存疑"
+        };
+        warn!(socket = %ownership.path().display(), "{detail}");
+    }
+    YieldOutcome { issued, taken_over }
 }
 
 async fn reject_orphaned_turn(mut turn: SpeechTurn, speech: &SpeechHandle) {
@@ -1233,14 +1299,22 @@ mod tests {
         let shell = Arc::new(RecordingShell::always_ok());
         let device = Device::with_runner(DeviceConfig::default(), shell.clone());
         let launcher = Path::new("/data/open-xiaoai/start-agent.sh");
+        let owned = still_owned_socket("yield-ok");
 
-        assert!(yield_to_native(&device, Some(launcher), "fatal").await);
+        assert!(yield_to_native(&device, Some(launcher), &owned, "fatal")
+            .await
+            .succeeded());
 
-        assert_eq!(shell.command_count(), 1, "让位就一条命令");
-        let script = shell.last_script().expect("必须调 launcher");
+        let scripts = shell.detached_scripts();
+        assert_eq!(scripts.len(), 1, "让位就一条命令");
         assert!(
-            script.ends_with("start-agent.sh stop"),
-            "必须是 launcher 的 stop（restore_native_frontend 在它里面）: {script}"
+            scripts[0].ends_with("start-agent.sh stop"),
+            "必须是 launcher 的 stop（restore_native_frontend 在它里面）: {}",
+            scripts[0]
+        );
+        assert!(
+            shell.scripts().is_empty(),
+            "让位必须走 detached 通道：普通通道的超时会杀掉正在 restore 的 sh"
         );
     }
 
@@ -1255,8 +1329,12 @@ mod tests {
         ));
         let device = Device::with_runner(DeviceConfig::default(), shell);
         let launcher = Path::new("/data/open-xiaoai/start-agent.sh");
+        // socket 还在我们手里 → 脚本报失败就是真失败
+        let owned = still_owned_socket("yield-fail");
 
-        assert!(!yield_to_native(&device, Some(launcher), "fatal").await);
+        assert!(!yield_to_native(&device, Some(launcher), &owned, "fatal")
+            .await
+            .succeeded());
     }
 
     /// 让位命令**本身没跑成**（超时 / 无法 fork）也必须如实返回 false。
@@ -1268,8 +1346,48 @@ mod tests {
         ));
         let device = Device::with_runner(DeviceConfig::default(), shell);
         let launcher = Path::new("/data/open-xiaoai/start-agent.sh");
+        let owned = still_owned_socket("yield-timeout");
 
-        assert!(!yield_to_native(&device, Some(launcher), "fatal").await);
+        assert!(!yield_to_native(&device, Some(launcher), &owned, "fatal")
+            .await
+            .succeeded());
+    }
+
+    /// 脚本报失败、但 socket 已经不是我们绑的那个 inode：原生其实已接管，
+    /// 必须按成功处理——否则运维会看到退出码 1，去查一件已经成功的事。
+    #[tokio::test]
+    async fn yield_treats_a_taken_over_socket_as_success_even_when_the_command_failed() {
+        let shell = Arc::new(RecordingShell::exiting_with(
+            1,
+            "another launcher operation is in progress",
+        ));
+        let device = Device::with_runner(DeviceConfig::default(), shell);
+        let launcher = Path::new("/data/open-xiaoai/start-agent.sh");
+
+        let owned = taken_over_socket("yield-taken-over");
+        let outcome = yield_to_native(&device, Some(launcher), &owned, "fatal").await;
+
+        assert!(!outcome.issued, "命令本身确实失败了");
+        assert!(outcome.taken_over, "但 socket 已经被接管走");
+        assert!(outcome.succeeded(), "这种情况必须算让位成功");
+        let _ = std::fs::remove_file(owned.path());
+    }
+
+    /// 命令干净退出、但 socket 还在我们手里：仍算成功（命令确实执行了），
+    /// 矛盾态由 `yield_to_native` 里的 warn 留痕，不由 `succeeded()` 表达。
+    #[tokio::test]
+    async fn yield_succeeds_when_the_command_succeeded_even_when_still_owned() {
+        let shell = Arc::new(RecordingShell::always_ok());
+        let device = Device::with_runner(DeviceConfig::default(), shell);
+        let launcher = Path::new("/data/open-xiaoai/start-agent.sh");
+        let owned = still_owned_socket("yield-still-mine");
+
+        let outcome = yield_to_native(&device, Some(launcher), &owned, "fatal").await;
+
+        assert!(outcome.issued);
+        assert!(!outcome.taken_over);
+        assert!(outcome.succeeded(), "命令成功就算让位达成");
+        let _ = std::fs::remove_file(owned.path());
     }
 
     /// 一次热加载的全量用例配置：同时含「热加载段」和「需重启段」。
@@ -1304,6 +1422,31 @@ agent:
             "xiaoai-reload-{tag}-{}-{stamp}.yaml",
             std::process::id()
         ))
+    }
+
+    /// 「socket 还在我们手里」：临时文件 + 它自己的 inode。
+    fn still_owned_socket(tag: &str) -> SocketOwnership {
+        use std::os::unix::fs::MetadataExt;
+        let path = temp_config_path(tag).with_extension("usock");
+        std::fs::write(&path, b"x").expect("写临时 socket 占位文件");
+        let inode = std::fs::metadata(&path).expect("读 inode").ino();
+        SocketOwnership::for_test(path, inode)
+    }
+
+    /// 「已经被接管走」：复刻 launcher 的 `rm -f` + `mv`，让路径指向另一个 inode。
+    ///
+    /// 不能用「路径不存在」来代表已接管——那正是 rm→mv 之间窗口的样子，
+    /// 也可能是 mv 失败或脚本没跑到 restore。
+    fn taken_over_socket(tag: &str) -> SocketOwnership {
+        use std::os::unix::fs::MetadataExt;
+        let live = temp_config_path(tag).with_extension("usock");
+        let native = live.with_extension("native.usock");
+        std::fs::write(&live, b"agent").expect("写 agent socket 占位");
+        std::fs::write(&native, b"native").expect("写原生 socket 占位");
+        let mine = std::fs::metadata(&live).expect("读 inode").ino();
+        std::fs::remove_file(&live).expect("rm");
+        std::fs::rename(&native, &live).expect("mv");
+        SocketOwnership::for_test(live, mine)
     }
 
     /// 重载期间的 SIGHUP 必须「合并成下一轮」，不能静默丢弃：否则用户改错再改回来、
@@ -1458,8 +1601,13 @@ device:
         let shell = Arc::new(RecordingShell::always_ok());
         let device = Device::with_runner(DeviceConfig::default(), shell.clone());
 
-        assert!(!yield_to_native(&device, None, "fatal").await);
+        assert!(
+            !yield_to_native(&device, None, &still_owned_socket("no-launcher"), "fatal")
+                .await
+                .succeeded()
+        );
 
         assert_eq!(shell.command_count(), 0, "找不到 launcher 就别瞎跑命令");
+        assert!(shell.detached_scripts().is_empty());
     }
 }
