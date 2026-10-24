@@ -52,6 +52,35 @@ frontend instead of linking the agent directly to model-specific shared
 libraries. Compatibility still depends on the firmware providing a compatible
 `mipns` executable, socket protocol, PCM mode, and `pnshelper` control path.
 
+## Fault Handling Boundary
+
+Two owners, two scopes. Keep them apart so they never fight over the same
+takeover:
+
+| Owner | Scope it watches | Its only allowed action |
+|---|---|---|
+| the launcher's watchdog loop (`start-agent.sh`, `WATCHDOG_INTERVAL`, default 5 s) | process level: agent process gone, `speech.usock` inode replaced, socket protection mount disappeared | `start-agent.sh restart` — tear the takeover down and install it again |
+| the agent process itself (`interrupt_turn` / `yield_to_native` in `main.rs`) | protocol level: one turn aborted, capture or ASR failed, `SpeechServiceEvent::Fatal` | `start-agent.sh stop` — finish the native dialog, drop the socket protection, bring native `mico_aivs_lab` / `pns` back, then exit |
+
+Rules:
+
+- The watchdog only observes. It never sends protocol messages: no
+  `finish_dialog`, no `stop_capture`. Conversely the agent never re-installs the
+  takeover: getting the microphone back requires a full `start-agent.sh start`
+  (pns override, protected `mico` restart, `pnshelper` follow-up request), not a
+  binary restart.
+- Both sides funnel through the launcher's `launcher.lock` (`mkdir` lock). When
+  the lock is held, the loser logs and returns; it must not retry in a loop, or
+  the two recoveries will race each other.
+- Yielding stops the watchdog on purpose. After a yield the speaker is native
+  xiaoai again and stays that way until a human runs `start-agent.sh start`.
+  That is the intent: a speaker that answers as native xiaoai is better than one
+  that can be woken but never answers.
+- Known gap, tracked in issue #13: a single `speech.usock` send/recv error still
+  escalates to `SpeechServiceEvent::Fatal`. Grading those errors (warn and
+  continue for recoverable `errno`s, fatal only for an unusable socket) needs
+  its own bounded-retry design and is not implemented yet.
+
 ## Cross Compilation
 
 Do not assume this project cannot be cross-compiled locally.
