@@ -45,6 +45,12 @@ asr:
     prompt: ""
     timeout_s: 5
     retries: 1
+    # 蚂蚁百灵（实测 2026-10-25）：接口与 OpenAI audio/transcriptions 兼容。
+    #   base_url: https://api.ant-ling.com/v1
+    #   model: Ming-3.0-asr-tiny
+    #   language: zh            # 留空 = 混语种识别
+    # 限制：单文件 ≤10 MB、音频 ≤30 秒，只接受 wav/mp3；返回格式只支持 json。
+    # 注意 asr 段是「需要重启」的段（AsrClient 启动时定型），改完要重启 agent。
 
   # OpenAI Realtime transcription WebSocket settings. Used when provider is openai_realtime.
   openai_realtime:
@@ -118,6 +124,14 @@ tts:
   # killall miplayer 2>/dev/null; miplayer -f {path} >/tmp/xiaoai-tts-player.log 2>&1 &
   # playback_command: null
   # OpenAI 兼容的 /v1/audio/speech 后端：base_url 指向谁就是谁（官方/中转/局域网自建 shim）
+  # 实测可用的后端：蚂蚁百灵（2026-10-25，OH2P 真机链路待验）
+  #   base_url: https://api.ant-ling.com/v1
+  #   model: Ming-3.0-tts
+  #   voice: alloy          # 或改用 instructions（见下），两者至少给一个
+  #   response_format: wav
+  #   sample_rate: 16000    # 与语音前端一致，省一半流量
+  # 两个坑：① voice/references/instructions 三者都不给 → 400；
+  #         ② voice 传了不存在的音色 → HTTP 200 但 body 为空（代码按空音频判失败并回退）。
   openai:
     base_url: https://api.openai.com/v1
     api_key: ""
@@ -126,6 +140,8 @@ tts:
     # wav 是这台机器 miplayer 已实测能放的格式；mp3 体积小一半，等真机验过再换
     response_format: wav
     # speed: 1.0
+    # sample_rate: 16000
+    # instructions: "用温柔的女声，语速稍慢"
     timeout_s: 30
     # output_dir: /tmp
 

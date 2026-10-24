@@ -974,9 +974,17 @@ async fn run_session(
         state.device.shut_led(led.led_thinking).await;
         if !reply.text.trim().is_empty() {
             state.device.show_led(led.led_speaking).await;
-            TtsRouter::new(state.device.clone())
+            // TTS 失败**不计入**「连续失败 → 让位」：那条机制的用途是解决
+            // 「能唤醒但答不上」的空转（大脑坏了）；TTS 挂了是嗓子坏了，模型其实
+            // 已经答出来。而且配置了 fallback_to_native: false 的人预期是「宁可
+            // 不说话」，若因此让位，音箱会整体下线等人工 start-agent.sh start，
+            // 落差太大。所以这里只 warn + 继续这一轮剩下的流程。
+            if let Err(err) = TtsRouter::new(state.device.clone())
                 .speak(&config.tts, &reply.text)
-                .await?;
+                .await
+            {
+                warn!(error = %err, "回答的语音合成失败：不计入连续失败，本轮无声音但流程继续");
+            }
         }
         if reply.should_end {
             info!("agent ended conversation: {}", reply.end_reason);

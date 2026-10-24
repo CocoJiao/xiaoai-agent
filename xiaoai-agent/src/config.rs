@@ -719,6 +719,13 @@ pub struct OpenAiTtsConfig {
     /// 解析库的额外风险，等真机验过再考虑换（体积小一半）。
     pub response_format: String,
     pub speed: Option<f32>,
+    /// 采样率。Ant Ling 的 `Ming-3.0-tts` 支持 8000/16000/22050/24000，
+    /// 默认 22050；音箱侧播放 16000 就够（和语音前端一致），还能省一半流量。
+    pub sample_rate: Option<u32>,
+    /// 语音控制指令（音色风格描述）。Ant Ling 要求
+    /// `voice` / `references` / `instructions` 三者至少给一个，
+    /// 否则 400 `voice or references or instructions are required`。
+    pub instructions: Option<String>,
     pub timeout_s: f64,
     /// 音频落盘目录。默认 `/tmp`（tmpfs）：不写 NAND，重启即清。
     pub output_dir: Option<PathBuf>,
@@ -733,6 +740,8 @@ impl Default for OpenAiTtsConfig {
             voice: "alloy".to_string(),
             response_format: "wav".to_string(),
             speed: None,
+            sample_rate: None,
+            instructions: None,
             timeout_s: 30.0,
             output_dir: None,
         }
@@ -769,7 +778,7 @@ pub enum TtsProvider {
     #[default]
     Native,
     Doubao,
-    #[serde(rename = "openai")]
+    // `rename_all = "lowercase"` 已经把 OpenAi 映射成 `openai`，不需要再写 rename。
     OpenAi,
 }
 

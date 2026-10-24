@@ -14,6 +14,12 @@ use crate::device::Device;
 /// - `miplayer -f <本地文件>` 可用（日志 `event(Playing)` → `EndReached`）；
 /// - `miplayer` **播完不会自己退出**，所以下次播放前必须 `killall`；
 /// - 后台起播（`&`），否则一条命令就吃掉整个超时预算。
+///
+/// 已知副作用：这句 `killall miplayer` 也会杀掉 `device.play_url_command` 放音乐
+/// 用的那个 `miplayer`——换到外部 TTS 之后「放歌时说话，歌没了」。native 路径
+/// （`tts_play.sh`）不碰 `miplayer`，所以两条路径行为不同。统一的正确做法是
+/// 「duck → 播 → unduck」（`device.duck_audio_command` / `unduck_audio_command`），
+/// 但那需要先确认压音量对 TTS 播放通道也生效，留待后续。
 pub const DEFAULT_PLAYBACK_COMMAND: &str =
     "killall miplayer 2>/dev/null; miplayer -f {path} >/tmp/xiaoai-tts-player.log 2>&1 &";
 
@@ -118,20 +124,33 @@ impl TtsRouter {
         if let Some(speed) = tts.speed {
             body["speed"] = json!(speed);
         }
+        if let Some(sample_rate) = tts.sample_rate {
+            body["sample_rate"] = json!(sample_rate);
+        }
+        if let Some(instructions) = tts.instructions.as_deref() {
+            if !instructions.trim().is_empty() {
+                body["instructions"] = json!(instructions);
+            }
+        }
 
         let request = reqwest::Client::new()
             .post(tts.endpoint())
             .bearer_auth(&tts.api_key)
             .json(&body);
-        let response = tokio::time::timeout(
-            Duration::from_secs_f64(tts.timeout_s.max(1.0)),
-            request.send(),
-        )
-        .await
-        .context("TTS 请求超时")??;
+        // timeout_s 是「整体上限」，不是「等到响应头为止」：reqwest 的 send()
+        // 在收到响应头就返回，body 是 bytes() 才读的。一个「200 之后几乎不吐
+        // 数据」的后端会让这一轮 turn 永久卡住——LED 停在说话状态、空闲超时也
+        // 要等这一轮结束才生效。所以两层都用同一个 limit 兜住。
+        let limit = Duration::from_secs_f64(tts.timeout_s.max(1.0));
+        let response = tokio::time::timeout(limit, request.send())
+            .await
+            .context("TTS 请求超时")??;
 
         let status = response.status();
-        let bytes = response.bytes().await.context("读取 TTS 响应体失败")?;
+        let bytes = tokio::time::timeout(limit, response.bytes())
+            .await
+            .context("TTS 响应体读取超时")?
+            .context("读取 TTS 响应体失败")?;
         if !status.is_success() {
             // 错误体可能是 JSON、也可能是中转的 HTML 页，取前 200 字节止血。
             bail!(
@@ -168,6 +187,7 @@ fn extension_for(response_format: &str) -> &str {
         "flac" => "flac",
         "pcm" => "pcm",
         // 未知格式也让它落盘，别在这里拦——真正的判据是播放器能不能放。
+        // 结局是「播放失败 → 回退系统 TTS」，不是静默成功。
         _ => "bin",
     }
 }
@@ -340,6 +360,58 @@ mod tests {
             .to_string();
         assert!(err.contains("fallback_to_native=false"), "{err}");
         assert_eq!(shell.command_count(), 0);
+    }
+
+    /// `timeout_s` 必须覆盖**响应体读取**，不只是等到响应头。
+    ///
+    /// 假后端：回 `200` + 一个巨大的 `Content-Length`，然后一个字节都不写。
+    /// 如果 body 不受 timeout 约束，这个测试会挂到测试超时；受约束时应当在
+    /// `timeout_s` 附近返回 Err 并回退系统 TTS。
+    #[tokio::test]
+    async fn tts_body_read_is_bounded_by_the_timeout() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                // 用 13/10 拼 CRLF：源码里不出现转义序列，避免被各种工具链改写。
+                let nl: String = [13_u8, 10_u8].iter().map(|byte| *byte as char).collect();
+                let head = format!("HTTP/1.1 200 OK{nl}Content-Length: 999999{nl}{nl}");
+                let _ = socket.write_all(head.as_bytes()).await;
+                // 头发完就装死，body 永不到齐。
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+
+        let shell = Arc::new(RecordingShell::always_ok());
+        let config = TtsConfig {
+            provider: TtsProvider::OpenAi,
+            openai: OpenAiTtsConfig {
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                api_key: "sk-test".to_string(),
+                timeout_s: 1.0,
+                output_dir: Some(std::env::temp_dir()),
+                ..OpenAiTtsConfig::default()
+            },
+            ..TtsConfig::default()
+        };
+
+        let started = std::time::Instant::now();
+        router(shell.clone())
+            .speak(&config, "超时测试")
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "body 读取必须受 timeout_s 约束，实际等了 {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            shell.count_matching("/usr/sbin/tts_play.sh"),
+            1,
+            "超时后必须回退系统 TTS，而不是这一轮直接没声音"
+        );
     }
 
     /// 播放命令必须带 `{path}`，且路径要被引号化（带空格的文件名不会裂开）。
