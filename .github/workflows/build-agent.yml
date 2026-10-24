@@ -12,6 +12,9 @@ on:
   pull_request:
     branches:
       - main
+      # 集成分支：issue #10-#19 的各个 PR 都指向这里。不写这一行，
+      # 指向集成分支的 PR 一个 check 都不会跑，看起来「没报错」其实是没测。
+      - "integration/**"
     paths:
       - ".github/workflows/build-agent.yml"
       - "xiaoai-agent/**"
