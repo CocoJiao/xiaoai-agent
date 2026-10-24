@@ -702,6 +702,53 @@ pub struct TtsConfig {
     /// 留 `None` 用内置默认值；写成字符串是为了让真机上的播放方式可换，
     /// 而不用重新编译（`miplayer` 与 `aplay` 在同一台机器上行为不同）。
     pub playback_command: Option<String>,
+    /// OpenAI 兼容的 `/v1/audio/speech` 后端。`base_url` 指向谁就是谁：
+    /// 官方、中转、局域网自建 shim 都是同一套协议，所以只有这一段。
+    pub openai: OpenAiTtsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct OpenAiTtsConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub voice: String,
+    /// `mp3` / `wav` / `opus` / `aac` / `flac` / `pcm`。
+    /// 默认 wav：这台机器的 `miplayer` 播 wav 已被实测确认，mp3 是同一播放器
+    /// 解析库的额外风险，等真机验过再考虑换（体积小一半）。
+    pub response_format: String,
+    pub speed: Option<f32>,
+    pub timeout_s: f64,
+    /// 音频落盘目录。默认 `/tmp`（tmpfs）：不写 NAND，重启即清。
+    pub output_dir: Option<PathBuf>,
+}
+
+impl Default for OpenAiTtsConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: String::new(),
+            model: "gpt-4o-mini-tts".to_string(),
+            voice: "alloy".to_string(),
+            response_format: "wav".to_string(),
+            speed: None,
+            timeout_s: 30.0,
+            output_dir: None,
+        }
+    }
+}
+
+impl OpenAiTtsConfig {
+    pub fn endpoint(&self) -> String {
+        format!("{}/audio/speech", self.base_url.trim_end_matches('/'))
+    }
+
+    pub fn dir(&self) -> PathBuf {
+        self.output_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+    }
 }
 
 impl Default for TtsConfig {
@@ -710,6 +757,7 @@ impl Default for TtsConfig {
             provider: TtsProvider::Native,
             fallback_to_native: true,
             playback_command: None,
+            openai: OpenAiTtsConfig::default(),
         }
     }
 }

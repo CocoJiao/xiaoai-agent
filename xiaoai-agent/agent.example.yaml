@@ -117,6 +117,17 @@ tts:
   # 播放本地音频文件的命令模板（{path} 为占位符）。留空用内置默认值：
   # killall miplayer 2>/dev/null; miplayer -f {path} >/tmp/xiaoai-tts-player.log 2>&1 &
   # playback_command: null
+  # OpenAI 兼容的 /v1/audio/speech 后端：base_url 指向谁就是谁（官方/中转/局域网自建 shim）
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key: ""
+    model: gpt-4o-mini-tts
+    voice: alloy
+    # wav 是这台机器 miplayer 已实测能放的格式；mp3 体积小一半，等真机验过再换
+    response_format: wav
+    # speed: 1.0
+    timeout_s: 30
+    # output_dir: /tmp
 
 music:
   enabled: false
