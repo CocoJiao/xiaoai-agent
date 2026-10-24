@@ -524,6 +524,17 @@ async fn yield_after_consecutive_failures(
     failures: &Arc<AtomicU32>,
 ) -> Option<i32> {
     let outcome = yield_to_native(device, launcher, ownership, "consecutive failures").await;
+    // 先看脚本有没有明确说「拆到一半」：exit 5 的后两格（mico/pns 起不来）发生在
+    // `rm -f` + `mv` **之后**，inode 已经换回原生的了，`succeeded()` 会命中
+    // `taken_over == true` 而直接判成功。可那种状态是「socket 就位、原生服务没跑、
+    // watchdog 已停」——正是本 PR 想消灭的「看起来一切正常」。脚本比 inode 知道得多，
+    // 所以这一档必须以脚本为准。
+    if outcome.exit_code == Some(LAUNCHER_EXIT_HALF_DISMANTLED) {
+        error!(
+            "让位命令报告原生服务未起来（exit=5）：inode 已换回原生，但 mico/pns 不可用，判失败退出"
+        );
+        return Some(1);
+    }
     if outcome.succeeded() {
         return Some(0);
     }
@@ -685,6 +696,11 @@ fn launcher_path() -> Option<PathBuf> {
 /// 只有 3 允许继续运行——其余都意味着前端已经被动过，继续跑会表现为
 /// 「LED 正常闪、麦克风不工作」。
 const LAUNCHER_EXIT_UNTOUCHED: i32 = 3;
+/// `restore_native_files` 之后还有两步（`start_native_mico` / `pns start`）。
+/// 它们失败时 **inode 已经换回原生的了**，但 mico/pns 没跑起来——socket 在位、
+/// 麦克风不工作。这是唯一一个「inode 事实说成功、脚本自述说失败」的格子，
+/// 必须以脚本为准，所以它的判定要排在 `succeeded()` 之前。
+const LAUNCHER_EXIT_HALF_DISMANTLED: i32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct YieldOutcome {
@@ -1528,6 +1544,34 @@ mod tests {
             assert_eq!(code, Some(1), "退出码 {exit} 说明前端已被动过，必须退出");
             let _ = std::fs::remove_file(owned.path());
         }
+    }
+
+    /// `exit 5` 必须压过「inode 已换」：`rm` + `mv` 成功后 mico/pns 没起来，
+    /// socket 在位但麦克风不工作——这条在当前实现下曾经返回 `Some(0)`。
+    #[tokio::test]
+    async fn exit_code_5_beats_a_replaced_inode() {
+        let shell = Arc::new(RecordingShell::exiting_with(
+            LAUNCHER_EXIT_HALF_DISMANTLED,
+            "failed to restart native mico",
+        ));
+        let device = Device::with_runner(DeviceConfig::default(), shell);
+        let failures = Arc::new(AtomicU32::new(YIELD_AFTER_CONSECUTIVE_FAILURES));
+        let taken = taken_over_socket("half-dismantled");
+
+        let code = yield_after_consecutive_failures(
+            &device,
+            Some(Path::new("/x/start-agent.sh")),
+            &taken,
+            &failures,
+        )
+        .await;
+
+        assert_eq!(
+            code,
+            Some(1),
+            "inode 换了但原生服务没起来，不能算成功（退出码 0 = 哑且无任何信号）"
+        );
+        let _ = std::fs::remove_file(taken.path());
     }
 
     /// 让位**超时**不能算「脚本没动前端」：脚本可能正停在还原中途，此时

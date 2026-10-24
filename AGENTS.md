@@ -91,13 +91,20 @@ Rules:
 - The `stop` exit code is part of that contract, and it is the only thing that
   separates "the frontend was never touched" from "the frontend was half
   dismantled":
-  `0` restored · `3` untouched (launcher lock busy, launcher not executable) ·
+  `0` restored · `3` untouched (launcher lock busy) ·
   `4` pns/watchdog stopped but mico still up · `5` half-dismantled (protection
   still mounted, native files not restored, native services not back).
   Only `3` lets `yield_after_consecutive_failures` return `None` and keep running;
-  `4`/`5`/timeout all exit. Changing one side without the other silently turns
-  "untouched" into "half dismantled" — that pairing is why the codes live in
-  `start-agent.sh` with a pointer to `YieldOutcome` in `main.rs`.
+  `4`/`5`/timeout all exit. A missing or non-executable launcher never reaches `3`
+  (it becomes `exit_code: None` or `126`, both of which exit) — the docs must not
+  read more optimistically than the code.
+  `5` is checked **before** `succeeded()`: its last two steps (`start_native_mico`,
+  `pns start`) run after `rm` + `mv`, so the inode already points at the native
+  socket while mico/pns are down — socket in place, microphone dead. When the
+  script and the inode disagree, the script knows more.
+  Changing one side without the other silently turns "untouched" into "half
+  dismantled" — that pairing is why the codes live in `start-agent.sh` with a
+  pointer to `YieldOutcome` in `main.rs`.
 - Yielding stops the watchdog on purpose. After a yield the speaker is native
   xiaoai again and stays that way until a human runs `start-agent.sh start`.
   That is the intent: a speaker that answers as native xiaoai is better than one
