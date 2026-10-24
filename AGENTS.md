@@ -106,8 +106,11 @@ Rules that must survive future refactors:
 - The reload runs in a **spawned task**, never inline in the event loop: MCP
   reconnect is bounded by `2 × server.timeout_s` per server (20 s default), and
   during that window `speech.recv()` must keep being polled or wake events and
-  `Fatal`-triggered yielding are delayed. Overlapping `SIGHUP`s are collapsed by
-  an `AtomicBool` guard.
+  `Fatal`-triggered yielding are delayed. Overlapping `SIGHUP`s are **coalesced**:
+  a request arriving mid-reload is remembered and triggers one more round that
+  re-reads the file (never silently dropped — otherwise the *first*, possibly
+  wrong, edit would win), and the running flag is released by an **RAII guard** so
+  a panicking reload cannot leave hot reload disabled forever.
 - Inside `AgentRuntime`, the config snapshot and the tool server are swapped
   **together** through one `AgentView` (`RwLock<AgentView>`), and one view is read
   per turn and threaded down. Swapping them separately would leave a window where

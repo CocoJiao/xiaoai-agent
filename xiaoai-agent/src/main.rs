@@ -73,8 +73,8 @@ async fn main() -> anyhow::Result<()> {
     let failures = Arc::new(AtomicU32::new(0));
     let (reload_tx, mut reload_rx) = mpsc::channel::<()>(1);
     spawn_sighup_listener(reload_tx);
-    // 同时只允许一次重载在跑：相邻两次 SIGHUP 不该叠成两次工具重建 + 两次 MCP 重连。
-    let reloading = Arc::new(AtomicBool::new(false));
+    // 重载去抖门：同时只跑一个，期间的请求合并成下一轮。
+    let reload_gate = Arc::new(ReloadGate::default());
     let launcher = launcher_path();
     if launcher.is_none() {
         warn!("找不到 start-agent.sh：故障时无法主动让位，只能退出等 watchdog 重启");
@@ -222,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
                 // 重载不进主循环：MCP 重连单 server 最坏 20 秒（mcp.rs 的
                 // 2×timeout_s 上限），这段时间必须继续 poll 语音事件——
                 // 语音是这台设备唯一的命脉，配置重载是可以等的东西。
-                spawn_config_reload(&config, cli.config.clone(), &agent, &reloading);
+                spawn_config_reload(&config, cli.config.clone(), &agent, &reload_gate);
             }
             _ = session_check.tick() => {
                 let session_finished = active_session
@@ -439,7 +439,52 @@ fn spawn_sighup_listener(tx: mpsc::Sender<()>) {
     });
 }
 
-/// 把一次重载丢到后台跑，同一时刻只允许一个。
+/// 重载去抖门：同一时刻只跑一个重载任务，期间的请求**合并**成「跑完再跑一轮」。
+///
+/// 为什么是合并而不是丢弃：重载要跑几十秒（MCP 重连），用户完全可能在这期间
+/// 发现自己写错了再改一次。丢弃的话最终生效的是**第一次那份**，用户只看到一条
+/// 很容易被当成噪音的 warn——那正好是「改了、发了信号、没生效」这个本 PR 要消灭的
+/// 失败模式。合并（每轮重读文件）等于「用最后的文件状态跑一次」。
+#[derive(Default)]
+struct ReloadGate {
+    running: AtomicBool,
+    pending: AtomicBool,
+}
+
+impl ReloadGate {
+    /// 抢占本轮执行权。`false` 表示已有任务在跑，本次请求已并入下一轮。
+    fn begin(&self) -> bool {
+        if self.running.swap(true, Ordering::AcqRel) {
+            self.pending.store(true, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
+    /// 一轮结束：还有合并进来的请求就返回 `true`（需要再跑一轮）。
+    fn finish_round(&self) -> bool {
+        self.pending.swap(false, Ordering::AcqRel)
+    }
+
+    fn release(&self) {
+        self.running.store(false, Ordering::Release);
+    }
+}
+
+/// 用 RAII 复位 `running`，而不是手动 `store(false)`。
+///
+/// 手动复位的版本一旦 `apply_config_reload` panic（rig 代码、分配失败、task 被
+/// abort），`running` 就永久停在 `true`，此后每次 SIGHUP 都在 `begin()` 处被拒，
+/// 热加载永久失效——而用户下次用到这个功能可能是几周后。
+struct ReloadGuard(Arc<ReloadGate>);
+
+impl Drop for ReloadGuard {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// 把一次重载丢到后台跑。
 ///
 /// 为什么不在主循环里 `await`：`agent.reload()` 里含 MCP 重连，单 server 上限
 /// 2×`timeout_s`（默认 20 秒），多 server 累加。那段时间主循环不被 poll，
@@ -449,18 +494,25 @@ fn spawn_config_reload(
     config: &ConfigHandle,
     path: PathBuf,
     agent: &Arc<AgentRuntime>,
-    reloading: &Arc<AtomicBool>,
+    gate: &Arc<ReloadGate>,
 ) {
-    if reloading.swap(true, Ordering::AcqRel) {
-        warn!("上一次配置重载尚未结束，忽略这次 SIGHUP");
+    if !gate.begin() {
+        info!("配置重载进行中，本次 SIGHUP 合并到下一轮");
         return;
     }
     let config = config.clone();
     let agent = agent.clone();
-    let flag = reloading.clone();
+    let gate = gate.clone();
     tokio::spawn(async move {
-        apply_config_reload(&config, &path, &agent).await;
-        flag.store(false, Ordering::Release);
+        // 无论正常结束还是 panic 展开，都会把 running 复位。
+        let _guard = ReloadGuard(gate.clone());
+        loop {
+            apply_config_reload(&config, &path, &agent).await;
+            if !gate.finish_round() {
+                break;
+            }
+            info!("上一轮重载期间又来了一次 SIGHUP，按最新文件内容再跑一轮");
+        }
     });
 }
 
@@ -482,10 +534,6 @@ async fn apply_config_reload(handle: &ConfigHandle, path: &Path, agent: &AgentRu
     };
 
     let changes = classify_config_change(&current, &next);
-    if changes.is_noop() {
-        info!("配置文件无变化，跳过重载");
-        return;
-    }
     if !changes.rejected.is_empty() {
         warn!(
             rejected = ?changes.rejected,
@@ -499,16 +547,21 @@ async fn apply_config_reload(handle: &ConfigHandle, path: &Path, agent: &AgentRu
         );
     }
 
-    // 关键不变量：句柄里的配置必须等于「运行中真正生效的配置」。
-    // 所以待重启段与拒绝段要回填旧值，否则读句柄的人会以为 device/asr 已经换了。
-    let effective = keep_pending_sections(&current, &next, &changes);
     if !changes.should_apply() {
-        // 只有「需重启 / 被拒绝」的段变了：告警已经打过，句柄和工具服务器
-        // 都保持不动。否则会掉进「每发一次 SIGHUP 就白重建一次」的坑。
-        info!("本次没有可热加载的段，句柄与工具服务器保持不变");
+        // 告警已经打过。两种「不用重载」给不同文案，但只需要这一处判断：
+        // is_noop 是 should_apply == false 的子集，并排写两个会让人以为有别的区别。
+        if changes.is_noop() {
+            info!("配置文件无变化，跳过重载");
+        } else {
+            info!("本次没有可热加载的段，句柄与工具服务器保持不变");
+        }
         return;
     }
 
+    // 关键不变量：句柄里的配置必须等于「运行中真正生效的配置」。
+    // 所以待重启段与拒绝段要回填旧值，否则读句柄的人会以为 device/asr 已经换了。
+    // 放在 should_apply 判断之后：省掉「确定不重载」时白 clone 一整份配置。
+    let effective = keep_pending_sections(&current, &next, &changes);
     let previous = handle.replace(Arc::new(effective)).await;
     // 工具结构体各自持有配置快照（见 agent.rs 的 build_tool_server），
     // 所以换配置之后必须让 agent 重建工具服务器与 MCP 连接。
@@ -1251,6 +1304,48 @@ agent:
             "xiaoai-reload-{tag}-{}-{stamp}.yaml",
             std::process::id()
         ))
+    }
+
+    /// 重载期间的 SIGHUP 必须「合并成下一轮」，不能静默丢弃：否则用户改错再改回来、
+    /// 再发一次信号时，最终生效的还是第一次那份（写错的）。
+    #[test]
+    fn reload_gate_coalesces_requests_arriving_mid_reload() {
+        let gate = ReloadGate::default();
+        assert!(gate.begin(), "第一个请求拿到执行权");
+        assert!(!gate.begin(), "重载进行中：本次请求被并入下一轮");
+        assert!(gate.finish_round(), "有合并进来的请求，需要再跑一轮");
+        assert!(!gate.finish_round(), "没有新请求就结束");
+        gate.release();
+        assert!(gate.begin(), "释放之后又能接新请求");
+    }
+
+    /// N2 的回归：`running` 靠 RAII 复位，不能手动 store。
+    #[test]
+    fn reload_guard_releases_the_gate_on_drop() {
+        let gate = Arc::new(ReloadGate::default());
+        assert!(gate.begin());
+        {
+            let _guard = ReloadGuard(gate.clone());
+            assert!(!gate.begin(), "持锁期间不该再接新任务");
+        }
+        assert!(gate.begin(), "guard drop 之后必须已复位");
+    }
+
+    /// 真正会咬人的那一档：任务 panic 展开时也要复位。手动 `store(false)` 的写法
+    /// 在这里会把 running 永久留在 true，此后每次 SIGHUP 都静默失效。
+    #[test]
+    fn reload_guard_releases_the_gate_even_when_the_task_panics() {
+        let gate = Arc::new(ReloadGate::default());
+        assert!(gate.begin());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ReloadGuard(gate.clone());
+            panic!("simulated reload panic");
+        }));
+        assert!(outcome.is_err(), "这条用例本身要制造一次 panic");
+        assert!(
+            gate.begin(),
+            "panic 展开后 running 必须复位，否则热加载永久失效"
+        );
     }
 
     /// 热加载的核心承诺：能热加载的段立刻生效，需要重启的段在句柄里保持旧值。
