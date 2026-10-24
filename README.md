@@ -15,6 +15,10 @@ https://github.com/user-attachments/assets/b12d71b7-6734-4166-a2fe-959f82273702
 
 ## 特性
 
+> ⚠️ **能刷 open-xiaoai 官方客户端 ≠ 能用本 agent。** 官方客户端自己抓麦克风、自己播 PCM，
+> 不依赖 `speech.usock`；本 agent 恰恰依赖固件原生语音前端送出的 `speech.usock`。
+> 换机型前先按 [docs/models.md](docs/models.md) 的 6 条前提自查。
+
 - 完全接管语音对话流程：为了避免和原生小爱同学抢麦、抢答或触发小米云端控制，本项目会将原生小爱的麦克风输入静音，真实麦克风音频由 `xiaoai-agent` 接管，使用音箱系统 TTS 命令播报回复。
 - 无需单独搭建服务器：Agent 直接运行在音箱上，不再依赖独立的 WebSocket 消息桥接层。
 - 复用设备原生音频能力：使用固件内置的常驻唤醒和 VPM 音频回调机制，音频体验完美；支持连续对话、VAD、中途打断、回声消除、播放时录音。
