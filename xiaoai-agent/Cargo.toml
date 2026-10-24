@@ -14,6 +14,9 @@ debug = false
 
 [dependencies]
 anyhow = "1"
+# 本地控制面（issue #9）：唯一的用途是给 HA/运维一个内网 HTTP 入口，
+# 默认关闭。选 axum 而不是手写 HTTP：解析/keep-alive/超时这些都是重复造轮子。
+axum = "0.8"
 base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", features = ["clock", "serde"] }
