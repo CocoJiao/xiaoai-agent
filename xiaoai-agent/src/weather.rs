@@ -153,6 +153,12 @@ impl WeatherService {
 }
 
 fn looks_like_qweather_location(location: &str) -> bool {
+    let location = location.trim();
+    if location.is_empty() {
+        // 空串会让下面的 all() 恒为 true，被当成「坐标」直接发给 QWeather。
+        // 调用方目前先 trim + 判空，所以这里是加固而不是修线上 bug。
+        return false;
+    }
     location.contains(',') || location.chars().all(|ch| ch.is_ascii_digit())
 }
 
@@ -206,4 +212,91 @@ fn summarize_daily_weather(data: &Value, label: &str) -> Value {
         "updated_at": data.get("updateTime"),
         "forecast": forecast,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qweather_location_detection() {
+        // 有逗号的经纬度、纯数字的 location id 才算「已经是 QWeather 能认的坐标」。
+        // 注意：纯数字一律视为 location id，本函数不校验它是否真实存在
+        //（例如带国家码的 "86101180101" 也会被直接发出去）。
+        assert!(looks_like_qweather_location("114.1,30.52"));
+        assert!(looks_like_qweather_location("101180101"));
+        assert!(looks_like_qweather_location(" 101180101 "));
+        // 城市名要走 lookup，不能直接发
+        assert!(!looks_like_qweather_location("郑州"));
+        assert!(!looks_like_qweather_location("zhengzhou"));
+        // 加固：空串会让 all() 恒真，函数自身必须拒绝。调用方 get_weather 目前
+        // 已先 trim 并走 is_empty 分支，所以线上不可达——这里防的是以后有人
+        // 绕过那层判断直接调用它。
+        assert!(!looks_like_qweather_location(""));
+        assert!(!looks_like_qweather_location("   "));
+    }
+
+    #[test]
+    fn replace_query_pairs_overrides_without_duplicating() {
+        let mut url = Url::parse(
+            "https://devapi.qweather.com/v7/weather/3d?location=beijing&key=old&lang=zh",
+        )
+        .unwrap();
+        replace_query_pairs(&mut url, &[("location", "101180101"), ("key", "new")]);
+        let pairs = url
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(pairs.get("location").map(String::as_str), Some("101180101"));
+        assert_eq!(pairs.get("key").map(String::as_str), Some("new"));
+        // 没被替换的参数要原样保留
+        assert_eq!(pairs.get("lang").map(String::as_str), Some("zh"));
+        assert_eq!(
+            url.query_pairs().filter(|(key, _)| key == "key").count(),
+            1,
+            "同一个参数不能出现两次"
+        );
+    }
+
+    #[test]
+    fn preview_truncates_error_bodies() {
+        assert_eq!(preview("abc"), "abc");
+        let long = "字".repeat(300);
+        let previewed = preview(&long);
+        assert!(previewed.ends_with("..."));
+        // 240 个字符 + 三个点
+        assert_eq!(previewed.chars().count(), 243);
+    }
+
+    #[test]
+    fn summarize_daily_weather_keeps_at_most_three_days() {
+        let data = json!({
+            "code": "200",
+            "updateTime": "2026-10-24T13:00+08:00",
+            "daily": [
+                {"fxDate": "2026-10-24", "textDay": "晴", "textNight": "多云", "tempMin": "10", "tempMax": "22", "humidity": "40", "windDirDay": "东北风", "windScaleDay": "3-4"},
+                {"fxDate": "2026-10-25", "textDay": "阴", "textNight": "小雨", "tempMin": "11", "tempMax": "20", "humidity": "55", "windDirDay": "东风", "windScaleDay": "2"},
+                {"fxDate": "2026-10-26", "textDay": "小雨", "textNight": "阴", "tempMin": "9", "tempMax": "17", "humidity": "70", "windDirDay": "北风", "windScaleDay": "4-5"},
+                {"fxDate": "2026-10-27", "textDay": "晴", "textNight": "晴", "tempMin": "8", "tempMax": "19", "humidity": "45", "windDirDay": "西风", "windScaleDay": "3"}
+            ]
+        });
+        let summary = summarize_daily_weather(&data, "郑州");
+        assert_eq!(summary["location"], "郑州");
+        assert_eq!(summary["qweather_code"], "200");
+        let forecast = summary["forecast"].as_array().unwrap();
+        assert_eq!(forecast.len(), 3, "最多取三天，避免把整段 JSON 念出来");
+        assert_eq!(forecast[0]["date"], "2026-10-24");
+        assert_eq!(forecast[0]["day"], "晴");
+        assert_eq!(forecast[0]["temp_min_c"], "10");
+        assert_eq!(forecast[2]["wind_scale"], "4-5");
+    }
+
+    #[test]
+    fn summarize_daily_weather_falls_back_to_raw_body() {
+        let data = json!({"error": "no daily field"});
+        let summary = summarize_daily_weather(&data, "郑州");
+        assert_eq!(summary["location"], "郑州");
+        assert_eq!(summary["raw"]["error"], "no daily field");
+        assert!(summary.get("forecast").is_none());
+    }
 }
