@@ -10,6 +10,7 @@ mod music;
 mod shell;
 mod speech;
 mod tools;
+mod tts;
 mod vad;
 mod weather;
 
@@ -37,6 +38,7 @@ use crate::device::Device;
 use crate::music::MusicService;
 use crate::shell::TIMEOUT_ERROR_PREFIX;
 use crate::speech::{SocketOwnership, SpeechHandle, SpeechService, SpeechServiceEvent, SpeechTurn};
+use crate::tts::TtsRouter;
 
 const ASR_SERVICE_ERROR_PROMPT: &str = "抱歉，语音识别服务遇到问题，请稍后重试";
 const LLM_SERVICE_ERROR_PROMPT: &str = "抱歉，大模型服务遇到问题，请稍后重试";
@@ -972,7 +974,9 @@ async fn run_session(
         state.device.shut_led(led.led_thinking).await;
         if !reply.text.trim().is_empty() {
             state.device.show_led(led.led_speaking).await;
-            state.device.speak(&reply.text).await?;
+            TtsRouter::new(state.device.clone())
+                .speak(&config.tts, &reply.text)
+                .await?;
         }
         if reply.should_end {
             info!("agent ended conversation: {}", reply.end_reason);
@@ -1031,6 +1035,8 @@ async fn request_followup_capture(device: &Device) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 服务错误提示**故意**不走 `TtsRouter`：要念的是「服务出问题了」，此时外部
+/// TTS 大概率同样不可用，只有设备自带的 `tts_play.sh` 还靠得住。
 async fn speak_service_error(device: &Device, led: &DeviceConfig, text: &str) {
     device.shut_led(led.led_thinking).await;
     device.show_led(led.led_speaking).await;

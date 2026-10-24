@@ -108,6 +108,16 @@ mcp:
     # Empty means expose every tool from this server.
     tools: []
 
+tts:
+  # native（默认）= 设备自带 tts_play.sh；doubao / openai 尚未接入
+  provider: native
+  # 外部 provider 失败或尚未接入时回退系统 TTS。
+  # 关掉等于「宁可不说话也不用系统音色」，此时未接入的 provider 会直接报错。
+  fallback_to_native: true
+  # 播放本地音频文件的命令模板（{path} 为占位符）。留空用内置默认值：
+  # killall miplayer 2>/dev/null; miplayer -f {path} >/tmp/xiaoai-tts-player.log 2>&1 &
+  # playback_command: null
+
 music:
   enabled: false
   provider: navidrome

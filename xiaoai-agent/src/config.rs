@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub mcp: McpConfig,
     pub music: MusicConfig,
     pub airplay: AirPlayConfig,
+    pub tts: TtsConfig,
 }
 
 impl AppConfig {
@@ -688,6 +689,42 @@ fn section_changed<T: std::fmt::Debug>(old: &T, new: &T) -> bool {
     format!("{old:?}") != format!("{new:?}")
 }
 
+/// 回答的音频出口。第一步只定义「谁来念」与「失败怎么办」，
+/// 具体 provider 的参数（音色、密钥、端点）等接入时再加，避免先把配置面铺开。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TtsConfig {
+    pub provider: TtsProvider,
+    /// 外部 provider 失败（或尚未接入）时回退系统 TTS。
+    /// 默认 true：音箱「能出声」比「音色统一」重要。
+    pub fallback_to_native: bool,
+    /// 播放本地音频文件的命令模板，`{path}` 是占位符。
+    /// 留 `None` 用内置默认值；写成字符串是为了让真机上的播放方式可换，
+    /// 而不用重新编译（`miplayer` 与 `aplay` 在同一台机器上行为不同）。
+    pub playback_command: Option<String>,
+}
+
+impl Default for TtsConfig {
+    fn default() -> Self {
+        Self {
+            provider: TtsProvider::Native,
+            fallback_to_native: true,
+            playback_command: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TtsProvider {
+    /// 设备自带 `tts_play.sh`（默认，零外部依赖）。
+    #[default]
+    Native,
+    Doubao,
+    #[serde(rename = "openai")]
+    OpenAi,
+}
+
 pub fn classify_config_change(old: &AppConfig, new: &AppConfig) -> ConfigChanges {
     let mut changes = ConfigChanges::default();
 
@@ -714,6 +751,10 @@ pub fn classify_config_change(old: &AppConfig, new: &AppConfig) -> ConfigChanges
     }
     if section_changed(&old.music, &new.music) {
         changes.applied.push("music");
+    }
+    // tts: 每轮现读字段（provider 决定这次回答走哪条路），换句柄即生效。
+    if section_changed(&old.tts, &new.tts) {
+        changes.applied.push("tts");
     }
     if section_changed(&old.mcp, &new.mcp) {
         changes.applied.push("mcp");
@@ -765,12 +806,39 @@ fn resolve_optional_path(root: &Path, path: &mut Option<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
+
     use super::{
         classify_config_change, openai_base_url, openai_realtime_base_url, timeout_duration,
         AppConfig, AsrConfig, AsrProvider, ConfigChanges, ConfigHandle, LlmConfig, LlmProtocol,
-        LlmThinkingMode, McpConfig,
+        LlmThinkingMode, McpConfig, TtsProvider,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn tts_provider_parses_and_defaults_to_native() {
+        let default: AppConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(default.tts.provider, TtsProvider::Native);
+        assert!(default.tts.fallback_to_native);
+
+        let parsed: AppConfig =
+            serde_yaml::from_str("tts:\n  provider: openai\n  fallback_to_native: false\n")
+                .unwrap();
+        assert_eq!(parsed.tts.provider, TtsProvider::OpenAi);
+        assert!(!parsed.tts.fallback_to_native);
+    }
+
+    /// tts 段是「每轮现读」的热段：换 provider 不该要求重启接管流程。
+    #[test]
+    fn tts_change_is_hot() {
+        let old = AppConfig::default();
+        let mut new = AppConfig::default();
+        new.tts.provider = TtsProvider::Doubao;
+
+        let changes = classify_config_change(&old, &new);
+        assert_eq!(changes.applied, vec!["tts"]);
+        assert!(changes.needs_restart.is_empty());
+        assert!(changes.rejected.is_empty());
+    }
 
     #[test]
     fn example_uses_external_asr_by_default() {
