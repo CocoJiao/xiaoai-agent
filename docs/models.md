@@ -48,7 +48,7 @@ ls /proc/filesystems | grep -E "cifs|nfs"   # 大多数机型没有 → 不能�
 |---|---|---|
 | `speech.usock` 协议 | 有 | 未知，需按上面的第 2 条自查 |
 | `tts_play.sh --notify-pns` | 支持 | L06A 不支持（社区反馈，未验证）→ 改 `device.tts_command` |
-| `wakeup.sh WuW` | 恒返回 `{"code":1}`（该固件没有 `mediaplayer player_wakeup`） | 未知 |
+| `wakeup.sh WuW` | 外部调用返回 `{"code":1}`、未进入唤醒态（原因未定位，见参考实现 `docs/oh2p-roadmap.md` 的排查记录） | 未知 |
 | `/data/mipns/dialog_continuous` | 存在，但本项目刻意不启用（见 `AGENTS.md`） | 未知 |
 | 固件大小上限 | `0x02800000` | 参考实现对 LX06 用同一个上限，未验证 |
 

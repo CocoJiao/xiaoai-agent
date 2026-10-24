@@ -11,7 +11,7 @@
 |---|---|---|---|
 | ✅ 念一句话 | `/usr/sbin/tts_play.sh --notify-pns {text}` | `device.tts_command` | **同步返回、异步播放**：`exit 0` 只证明投递成功，不证明播完、更不证明人听到 |
 | ✅ 念一句话（不通知 pns） | `/usr/sbin/tts_play.sh {text}` | `device.tts_command`（L06A 等） | 部分机型没有 `--notify-pns` 参数，见第四节 |
-| ✅ 主动播报 | `/usr/sbin/tts_play.sh "<文本>" -n` | — | `-n` 发 pns 事件，适合提醒/简报这类「它自己开口」 |
+| ✅ 主动播报 | `/usr/sbin/tts_play.sh "<文本>" -n` | — | `-n` 发 pns 事件，适合提醒/简报这类「它自己开口」（参数出处：参考实现仓库里拷贝的设备脚本 `docs/shells/tts_play.sh`；本仓库没有该脚本的副本） |
 | ✅ 放网络音频 | `killall miplayer 2>/dev/null; miplayer -f {url} >/tmp/xiaoai-miplayer.log 2>&1 &` | `device.play_url_command` | 后台起播；不要等它返回，否则一条命令就吃掉整个超时预算 |
 | ✅ 停止出声 | `killall tts_play.sh miplayer 2>/dev/null; mphelper pause` | `device.stop_audio_command` | 打断用户说话时最先调这个 |
 | ✅ 暂停/继续音乐 | `mphelper pause` / `mphelper play` | `device.pause_audio_command` / `resume_audio_command` | 音乐通道；对 TTS 无效 |
@@ -26,7 +26,7 @@
 | `/tmp/mico_aivs_lab/usock/speech.usock` | 真麦克风的唯一出口 | agent 绑它；`mico_aivs_lab` 必须停掉才绑得上 |
 | `/tmp/mico_aivs_lab/usock/common.usock` | 系统 TTS / 网络服务用 | 这个不能停，`mico_aivs_lab` 要留着跑 |
 | `/etc/init.d/pns` | 启动 `mipns-*` 前端 | 里面的 `-r opus32` 决定送 Opus 还是 PCM；launcher 会把它复制到 `/tmp` 改掉再 bind-mount |
-| `/etc/init.d/mico_aivs_lab` | 系统 TTS 与网络服务 | `restart` 有 1–2 秒黑洞，**禁止每轮对话都调**（会把 ASR 事件流掐死，之后无法连续对话） |
+| `/etc/init.d/mico_aivs_lab` | 系统 TTS 与网络服务 | `restart` 有 1–2 秒黑洞（来源：本项目 OH2P 1.62.2 实测），**禁止每轮对话都调**（会把 ASR 事件流掐死，之后无法连续对话） |
 | `/data/mipns/dialog_continuous` | 原生全双工标记 | 本项目刻意不启用，见仓库根目录 `AGENTS.md` |
 | `ubus call pnshelper event_notify '{"src":1,"event":0}'` | 请求下一次采集 | 连续对话靠它；只发事件、不读 socket 的话音箱「能唤醒但没人答」 |
 
@@ -57,8 +57,8 @@ ubus call mediaplayer player_get_play_status '{}'
 
 | 命令 | 结论 |
 |---|---|
-| `/bin/wakeup.sh WuW` | 恒返回 `{"code":1}`：该固件没有 `mediaplayer player_wakeup` 这个方法 |
-| `arecord -D noop` 做长期耳朵 | `noop` 是单读者虚拟设备，且远场电平极低（实测人声峰值仅 105–171），识别差 |
+| `/bin/wakeup.sh WuW` | 外部调用返回 `{"code":1}`、未进入唤醒态；**原因尚未定位**。参考实现在其 `docs/oh2p-roadmap.md` 记录过同样现象（输出含 `code: 1` 与 `idle`，`instruction.log` 没有新的识别结果），原文也强调「不能假定 `code: 1` 一定无害，也不能假定 `idle` 就代表录音已经打开」 |
+| `arecord -D noop` 做长期耳朵 | `noop` 是单读者虚拟设备，且远场电平极低（来源：本项目 OH2P 1.62.2 实测，人声峰值仅 105–171；判据是停掉其它读者后用 `arecord -D noop` 读几秒看峰值），识别差 |
 | `mico_record`、`hw:0,0/0,1/0,2` | 恒定静音或 dummy，任何方案都别用 |
 | `ubus call mibrain ...`（当万能接口） | 语音事件不走它；LED 也不是它——LED 用的是 `/bin/show_led`、`/bin/shut_led` |
 

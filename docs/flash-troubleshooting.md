@@ -31,7 +31,7 @@ ssh -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa \
 2. **开机后被原厂 OTA 冲掉了吗。** 补丁会禁用原厂 OTA（`bin/ota`、`bin/flash.sh` 里 `return 1`），
    所以补丁不会被升级覆盖；但如果之前用过社区现成的跨版本补丁包，可能已经半坏。
 3. **是不是刷错了分区。** `partition system0` 相对路径、路径里不要有中文；
-   刷写窗口只有 1.5–1.8 秒（上电后 `1b8e:c003` 出现到消失），错过了就是「什么都没写」。
+   刷写窗口只有 1.5–1.8 秒（上电后 `1b8e:c003` 出现到消失；来源：本项目在 NAS 上刷 OH2P 1.62.2 时实测 5 次），错过了就是「什么都没写」。
 4. **确认到底写进去了什么**——用哈希比对，不要靠当时的终端记录：
 
 ```sh
@@ -46,11 +46,11 @@ md5sum /etc/shadow /etc/init.d/dropbear /bin/ota /etc/rc.local
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| 只有 macOS 能构建成功，Linux/Docker 在最后一步退出 | `squashfs.sh` 用 `stat -f %z`（BSD 语法），Linux 上取不到大小 → 超限校验被静默跳过 → 算术报错退出 | 已由 PR #9 修复（兼容 `gstat` / `stat -c` / `stat -f` / `wc -c`，取不到数字直接报错） |
-| 打包后设备起不来、体积明显变大 | `cp -rf $FIRMWARE assets/$FIRMWARE` 在目标已存在时会嵌套复制成 `assets/<fw>/<fw>/` | 改成只复制 `root-patched.squashfs`，并删掉嵌套目录 |
-| 镜像里有 `*.orig` 残留 | `patch -p1` 默认留备份 | 加 `--no-backup-if-mismatch`，打包前 `find . -name '*.orig' -delete` |
+| 只有 macOS 能构建成功，Linux/Docker 在最后一步退出 | `squashfs.sh` 用 `stat -f %z`（BSD 语法），Linux 上取不到大小 → 超限校验被静默跳过 → 算术报错退出 | **已修**（PR #9）：`gstat` / `stat -c` / `stat -f` / `wc -c` 四级回退，取不到数字直接报错 |
+| 打包后设备起不来、体积明显变大 | 早先 `cp -rf $FIRMWARE assets/$FIRMWARE` 在目标已存在时会嵌套复制成 `assets/<fw>/<fw>/` | **部分缓解 / 待修**：`squashfs.sh:86` 现在先 `rm -rf` 目标目录再 `cp -rf`，嵌套已不会发生；但仍是整目录复制，旧文件会一起进 assets。待改成只复制 `root-patched.squashfs` |
+| 镜像里有 `*.orig` 残留 | `patch -p1` 默认留备份 | **待修**：`patch.sh:27` 仍是 `patch -p1 < "$temp_patch"`，未加 `--no-backup-if-mismatch`。当前只能在打包前手工 `find . -name '*.orig' -delete` |
 | 下载固件这一步就失败 | 需要小米账号登录；`MI_DID` 要填**设备名**（如 `小爱音箱Pro`），不是账号 | `.env` 里 `MI_USER/MI_PASS`（或 `MI_TOKEN`）+ `MI_DID`；或直接给 `OTA='{"url":...}'` 跳过登录 |
-| 超级块与原厂不一致 | `mksquashfs` 参数不同 | 对齐原厂：`-comp xz -b 131072 -noappend -all-root -no-xattrs`（**不要** `-always-use-fragments -no-exports`） |
+| 超级块与原厂不一致 | `mksquashfs` 参数不同 | **待修**：`squashfs.sh:31` 现在仍带 `-always-use-fragments -no-exports`。要对齐原厂需改成 `-comp xz -b 131072 -noappend -all-root -no-xattrs`（去掉这两个参数） |
 | Windows 下 `update.exe` 直接 `0xC000007B` | 加载器阶段失败，原因未定位 | 换一台原生 Linux 主机刷（NAS 最方便），用 `tools/linux-x86/update` |
 | usbipd 转发给 WSL 不工作 | `attach` 耗时 3.5–3.9 s > 1.5–1.8 s 烧录窗口 | 同上，走原生 Linux |
 
