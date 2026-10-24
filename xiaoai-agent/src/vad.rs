@@ -125,8 +125,9 @@ impl SpeechCollector {
                 self.utterance_ms = block_ms * self.pre_roll.len() as u64;
                 self.log_noise_floor_with_trigger("speech_start", Some(level));
                 debug!("CAPTURE_SPEECH_START level={level:.5}");
-                // split() 把已累积的 pre-roll 整段取走（O(1)），不留引用；
-                // 后续块继续往同一个 BytesMut 里追加。
+                // split() 把已累积的 pre-roll 整段取走（O(1)，不复制音频）。注意它会把
+                // 容量一起带走：utterance 变成容量为 0 的空缓冲，下一轮第一块会重新
+                // 分配一次。省掉的是「每块一次分配」，不是「一轮只分配一次」。
                 let prefix = self.utterance.split().freeze();
                 return vec![SpeechEvent::SpeechStart(prefix)];
             }
