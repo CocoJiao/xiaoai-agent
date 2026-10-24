@@ -249,15 +249,22 @@ struct ActiveSession {
     turn_id: Arc<AtomicU64>,
 }
 
-/// 中断原因。它只决定两件事：session 重置的日志理由，以及清理时该用 warn
-/// 还是 debug 记录（唤醒打断的 stale finish_dialog 是预期，不是故障）。
+/// 中断原因。它决定两件事：session 重置的日志理由，以及收尾失败该按 debug
+/// 还是 warn 记。
+///
+/// 关键区分不是「谁触发的」，而是**这条收尾是不是预期内的正常结束**：
+/// 唤醒打断（旧轮被新流取代，`finish_dialog` 会 stale）、会话空闲超时、
+/// 前端正常关流都属于「预期」，只有 `Failure` 才是真故障。把它们混在
+/// `Failure` 里会让正常收尾在日志里以 warn 出现，现场排查时全是噪音。
 #[derive(Debug, Clone, Copy)]
 enum InterruptCause {
     /// 新的唤醒词打断了上一轮。
     Wake,
     /// 会话空闲超时（采集等不到人说话、等不到 follow-up 流）。
     IdleTimeout,
-    /// 采集中途失败（mipns 结束/取消流、ASR 出错等）。
+    /// 语音前端正常关闭了流（follow-up 发送端没了），不是故障。
+    FrontendStopped,
+    /// 采集中途失败（mipns 取消流、ASR 出错、ASR/TTS 抛出错误等）。
     Failure(&'static str),
 }
 
@@ -266,8 +273,14 @@ impl InterruptCause {
         match self {
             Self::Wake => "wake keyword",
             Self::IdleTimeout => "session idle timeout",
+            Self::FrontendStopped => "speech frontend stopped",
             Self::Failure(reason) => reason,
         }
+    }
+
+    /// 这条收尾是否属于预期内的正常结束。`false` 只有 `Failure`。
+    fn expected(self) -> bool {
+        !matches!(self, Self::Failure(_))
     }
 }
 
@@ -292,11 +305,22 @@ async fn interrupt_turn(
     cause: InterruptCause,
 ) {
     if let Err(err) = speech.finish_dialog(turn_id).await {
-        match cause {
-            InterruptCause::Wake => {
-                debug!(turn_id, error = %err, "旧 turn 已被新唤醒取代，finish_dialog 按 stale 跳过")
-            }
-            _ => warn!(turn_id, error = %err, "中断收尾时 finish_dialog 失败"),
+        // 预期内的收尾（唤醒打断的 stale、空闲超时后对面已经关了）不打 warn：
+        // 否则每轮正常结束都往设备日志里写一条「失败」，真故障就被淹了。
+        if cause.expected() {
+            debug!(
+                turn_id,
+                cause = cause.reason(),
+                error = %err,
+                "收尾的 finish_dialog 没有送达（属于预期路径）"
+            );
+        } else {
+            warn!(
+                turn_id,
+                cause = cause.reason(),
+                error = %err,
+                "中断收尾时 finish_dialog 失败"
+            );
         }
     }
     state.agent.reset_session(cause.reason()).await;
@@ -639,13 +663,7 @@ async fn run_session(
                 // follow-up 发送端没了：会话是正常收尾，不是失败。用 `?` 会让
                 // finish_dialog 的错误把整轮判成 Err，从而给「连续 3 轮失败让位」
                 // 白记一次，并且跳过 reset_session。
-                interrupt_turn(
-                    &state,
-                    &speech,
-                    turn_id,
-                    InterruptCause::Failure("speech frontend stopped"),
-                )
-                .await;
+                interrupt_turn(&state, &speech, turn_id, InterruptCause::FrontendStopped).await;
                 return Ok(());
             }
             Err(_) => {
@@ -929,6 +947,27 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("rejected follow-up capture"), "{err}");
+    }
+
+    /// 收尾的日志级别由「是不是预期内的正常结束」决定，不是由「谁触发的」决定。
+    /// 唤醒打断 / 空闲超时 / 前端正常关流都是正常收尾，只有 Failure 才是真故障——
+    /// 这条分类错了，正常结束会以 warn 写进设备日志，现场排查就全是噪音。
+    #[test]
+    fn interrupt_causes_mark_normal_endings_as_expected() {
+        assert!(InterruptCause::Wake.expected());
+        assert!(InterruptCause::IdleTimeout.expected());
+        assert!(InterruptCause::FrontendStopped.expected());
+        assert!(!InterruptCause::Failure("turn failed").expected());
+
+        assert_eq!(
+            InterruptCause::FrontendStopped.reason(),
+            "speech frontend stopped"
+        );
+        assert_eq!(InterruptCause::IdleTimeout.reason(), "session idle timeout");
+        assert_eq!(
+            InterruptCause::Failure("turn failed").reason(),
+            "turn failed"
+        );
     }
 
     /// 只认采集空闲超时。ASR 转写超时同样是 "timed out"，但那是服务故障，
