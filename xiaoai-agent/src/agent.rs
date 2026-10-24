@@ -372,6 +372,15 @@ impl AgentRuntime {
         control.end_reason = reason.to_string();
     }
 
+    /// 测试用：读回上一次 `reset_session` 写入的理由。
+    ///
+    /// 生产代码不需要这个读口，但中断清理的测试需要——`reset_session` 是
+    /// 「这条路径真的走过收尾」的唯一直接证据，否则只能靠日志断言。
+    #[cfg(test)]
+    pub async fn reset_reason_for_test(&self) -> String {
+        self.control.lock().await.end_reason.clone()
+    }
+
     /// 取一份历史快照，转成 rig 的消息序列。
     ///
     /// 拿的是克隆而不是锁本身：请求期间不能一直占着 `history`，否则同一轮里

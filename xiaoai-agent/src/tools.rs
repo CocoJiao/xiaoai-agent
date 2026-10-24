@@ -55,6 +55,10 @@ pub fn definition(
 /// 已知边界：这套 schema **还不满足 OpenAI strict mode** —— 那边要求
 /// `additionalProperties: false` 且所有属性都必须进 `required`。现在没有接
 /// strict 端点是对的（多数中转不支持那两个约束），以后要接需在这里补校验。
+///
+/// `cfg(test)`：唯一调用点在下面测试里，生产构建用不到。挂了它 `cargo check`
+/// 才回到零 warning（不挂是既有基线里的 1 个 dead_code）。
+#[cfg(test)]
 pub fn validate_definition(def: &ToolDefinition) -> Result<(), String> {
     let params = &def.parameters;
     if params.get("type").and_then(Value::as_str) != Some("object") {
