@@ -16,7 +16,7 @@ mod weather;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -38,7 +38,11 @@ use crate::device::Device;
 use crate::music::MusicService;
 use crate::shell::TIMEOUT_ERROR_PREFIX;
 use crate::speech::{SocketOwnership, SpeechHandle, SpeechService, SpeechServiceEvent, SpeechTurn};
-use crate::tts::TtsRouter;
+use crate::tts::{TtsHealth, TtsRouter};
+
+/// TTS 健康度是**进程级**的：局部变量会随每次 `run_session` 归零，
+/// 「坏了三天」就永远攒不到阈值。
+static TTS_HEALTH: LazyLock<TtsHealth> = LazyLock::new(TtsHealth::default);
 
 const ASR_SERVICE_ERROR_PROMPT: &str = "抱歉，语音识别服务遇到问题，请稍后重试";
 const LLM_SERVICE_ERROR_PROMPT: &str = "抱歉，大模型服务遇到问题，请稍后重试";
@@ -979,11 +983,14 @@ async fn run_session(
             // 已经答出来。而且配置了 fallback_to_native: false 的人预期是「宁可
             // 不说话」，若因此让位，音箱会整体下线等人工 start-agent.sh start，
             // 落差太大。所以这里只 warn + 继续这一轮剩下的流程。
-            if let Err(err) = TtsRouter::new(state.device.clone())
+            match TtsRouter::new(state.device.clone())
                 .speak(&config.tts, &reply.text)
                 .await
             {
-                warn!(error = %err, "回答的语音合成失败：不计入连续失败，本轮无声音但流程继续");
+                Ok(()) => TTS_HEALTH.on_success(),
+                Err(err) => {
+                    TTS_HEALTH.on_failure(&err);
+                }
             }
         }
         if reply.should_end {

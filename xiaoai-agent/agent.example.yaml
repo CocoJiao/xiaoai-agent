@@ -130,8 +130,11 @@ tts:
   #   voice: alloy          # 或改用 instructions（见下），两者至少给一个
   #   response_format: wav
   #   sample_rate: 16000    # 与语音前端一致，省一半流量
-  # 两个坑：① voice/references/instructions 三者都不给 → 400；
-  #         ② voice 传了不存在的音色 → HTTP 200 但 body 为空（代码按空音频判失败并回退）。
+  # 实测三个特性（详见 docs/ant-ling-tts-asr.md）：
+  #   ① voice/references/instructions 三者都不给 → 400；
+  #   ② voice 传了不存在的音色 → HTTP 200 但 body 为空（代码按空音频判失败并回退）；
+  #   ③ 换 voice 名或换 instructions 描述，输出几乎没差别——目前只有一套默认音色，
+  #      voice/instructions 的现实作用是满足接口要求，不是调音色。
   openai:
     base_url: https://api.openai.com/v1
     api_key: ""

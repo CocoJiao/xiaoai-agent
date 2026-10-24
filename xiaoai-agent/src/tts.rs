@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context};
 use serde_json::json;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::config::{OpenAiTtsConfig, TtsConfig, TtsProvider};
 use crate::device::Device;
@@ -22,6 +23,46 @@ use crate::device::Device;
 /// 但那需要先确认压音量对 TTS 播放通道也生效，留待后续。
 pub const DEFAULT_PLAYBACK_COMMAND: &str =
     "killall miplayer 2>/dev/null; miplayer -f {path} >/tmp/xiaoai-tts-player.log 2>&1 &";
+
+/// 连续多少次 TTS 失败后升级成 `error`。
+///
+/// 取 3：一次网络抖动不该刷红日志，但「每轮一条 warn」的长期故障必须能一眼看出来。
+pub const TTS_FAILURES_BEFORE_ALARM: u32 = 3;
+
+/// TTS 健康度：只做计数与日志分档，**不接让位机制**。
+///
+/// 让位是为了处理「能唤醒但答不上」的空转（大脑侧）；TTS 是输出侧，挂了不该把整个
+/// agent 下线。但摆到「永远只 warn」那一端又会让运维分不出「刚抖了一下」和
+/// 「已经坏了三天」——所以连续失败到阈值时升成 `error`。
+#[derive(Debug, Default)]
+pub struct TtsHealth {
+    consecutive_failures: AtomicU32,
+}
+
+impl TtsHealth {
+    pub fn on_success(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// 记一次失败并打日志，返回当前连续失败次数。
+    pub fn on_failure(&self, err: &anyhow::Error) -> u32 {
+        let streak = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if streak >= TTS_FAILURES_BEFORE_ALARM {
+            error!(
+                consecutive = streak,
+                error = %err,
+                "语音合成连续失败：检查 tts 后端/配置，或把 provider 改回 native（不影响对话，只是没声音）"
+            );
+        } else {
+            warn!(
+                consecutive = streak,
+                error = %err,
+                "回答的语音合成失败：不计入「连续失败让位」，本轮无声音但流程继续"
+            );
+        }
+        streak
+    }
+}
 
 /// 回答的音频出口。
 ///
@@ -360,6 +401,28 @@ mod tests {
             .to_string();
         assert!(err.contains("fallback_to_native=false"), "{err}");
         assert_eq!(shell.command_count(), 0);
+    }
+
+    /// 失败计数：到阈值前只 warn，连续三次后升 error；成功一次就清零。
+    #[test]
+    fn tts_health_escalates_then_resets() {
+        let health = TtsHealth::default();
+        let err = anyhow!("fake backend down");
+
+        assert_eq!(health.on_failure(&err), 1);
+        assert_eq!(health.on_failure(&err), 2);
+        assert_eq!(
+            health.on_failure(&err),
+            TTS_FAILURES_BEFORE_ALARM,
+            "第三次应当达到升级阈值"
+        );
+
+        health.on_success();
+        assert_eq!(
+            health.on_failure(&err),
+            1,
+            "成功一次必须清零，否则「坏过三天」永远都是同一个计数"
+        );
     }
 
     /// `timeout_s` 必须覆盖**响应体读取**，不只是等到响应头。
