@@ -24,7 +24,7 @@ use clap::Parser;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::agent::AgentRuntime;
@@ -95,21 +95,6 @@ async fn main() -> anyhow::Result<()> {
                             interaction_mode = turn.interaction_mode(),
                             "WAKE native mipns"
                         );
-                        if let Some(active) = active_session.take() {
-                            if !active.task.is_finished() {
-                                active.task.abort();
-                            }
-                            let _ = active.task.await;
-                        }
-
-                        let music_interrupted = music.interrupt_for_wake().await;
-                        let airplay_interrupted = airplay.interrupt_for_wake().await;
-                        if !music_interrupted && !airplay_interrupted {
-                            device.abort_current_output().await;
-                        }
-                        cleanup_turn_leds(&device, &config.device).await;
-                        agent.reset_session("wake keyword").await;
-
                         let state = TurnState {
                             config: config.clone(),
                             device: device.clone(),
@@ -118,14 +103,49 @@ async fn main() -> anyhow::Result<()> {
                             music: music.clone(),
                             airplay: airplay.clone(),
                         };
+                        if let Some(active) = active_session.take() {
+                            let interrupted = active.turn_id.load(Ordering::Relaxed);
+                            if !active.task.is_finished() {
+                                active.task.abort();
+                            }
+                            let _ = active.task.await;
+                            // 被 abort 的任务走不到自己的收尾，旧对话只能在这里
+                            // finish 掉、会话只能在这里重置。
+                            interrupt_turn(
+                                &state,
+                                &speech_handle,
+                                interrupted,
+                                InterruptCause::Wake,
+                            )
+                            .await;
+                        } else {
+                            agent.reset_session("wake keyword").await;
+                        }
+
+                        let music_interrupted = music.interrupt_for_wake().await;
+                        let airplay_interrupted = airplay.interrupt_for_wake().await;
+                        if !music_interrupted && !airplay_interrupted {
+                            device.abort_current_output().await;
+                        }
+                        // LED 清理留在这一层：任务已被 abort，run_turn 的尾巴跑不到。
+                        cleanup_turn_leds(&device, &config.device).await;
+
                         let (followup_tx, followup_rx) = mpsc::channel(2);
                         let handle = speech_handle.clone();
+                        let turn_id = Arc::new(AtomicU64::new(turn.id()));
+                        let task_turn_id = turn_id.clone();
                         let task = tokio::spawn(async move {
-                            if let Err(err) = run_turn(state, handle, turn, followup_rx).await {
+                            if let Err(err) =
+                                run_turn(state, handle, turn, followup_rx, task_turn_id).await
+                            {
                                 error!("turn failed: {err:?}");
                             }
                         });
-                        active_session = Some(ActiveSession { task, followup_tx });
+                        active_session = Some(ActiveSession {
+                            task,
+                            followup_tx,
+                            turn_id,
+                        });
                     }
                     SpeechServiceEvent::Turn(turn) => {
                         info!(
@@ -175,6 +195,62 @@ async fn main() -> anyhow::Result<()> {
 struct ActiveSession {
     task: JoinHandle<()>,
     followup_tx: mpsc::Sender<SpeechTurn>,
+    /// 会话当前正在处理的 turn。唤醒打断时靠它把「被打断的是哪一轮」告诉
+    /// `interrupt_turn`——任务被 abort 之后，任务内部的状态已经取不回来了。
+    turn_id: Arc<AtomicU64>,
+}
+
+/// 中断原因。它只决定两件事：session 重置的日志理由，以及清理时该用 warn
+/// 还是 debug 记录（唤醒打断的 stale finish_dialog 是预期，不是故障）。
+#[derive(Debug, Clone, Copy)]
+enum InterruptCause {
+    /// 新的唤醒词打断了上一轮。
+    Wake,
+    /// 会话空闲超时（采集等不到人说话、等不到 follow-up 流）。
+    IdleTimeout,
+    /// 采集中途失败（mipns 结束/取消流、ASR 出错等）。
+    Failure(&'static str),
+}
+
+impl InterruptCause {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Wake => "wake keyword",
+            Self::IdleTimeout => "session idle timeout",
+            Self::Failure(reason) => reason,
+        }
+    }
+}
+
+/// 三条中断路径唯一的收尾出口：唤醒打断、会话空闲超时、采集中途失败。
+///
+/// 全部 best-effort，每一步都不向外传播错误——清理本身绝不该把一轮会话
+/// 变成失败。两个具体理由：
+///
+/// 1. 唤醒打断时 mipns 已经准备了新 stream，`speech.rs` 的 `last_turn_id`
+///    检查会把对旧 turn 的 `finish_dialog` 判成 stale。那是预期路径。
+/// 2. 写成显式 `async fn` 而不是 Drop guard：Drop 不能 await，只能在 Drop 里
+///    塞一个 `tokio::spawn`，于是断言前得先「睡一下」，测试立刻变成靠时间猜。
+///
+/// 这里**不发** `stop_capture`：停采集是 `capture.rs` 的职责，而且它有不对称
+/// 契约——超时必须先补发 stop_capture（否则 mipns 的 stream 一直挂着、下次
+/// 唤醒绑不上新流），`End`/`Cancelled` 则不许补发（流是对方结束的）。在这一层
+/// 统一补一条会把那个契约踩掉。
+async fn interrupt_turn(
+    state: &TurnState,
+    speech: &SpeechHandle,
+    turn_id: u64,
+    cause: InterruptCause,
+) {
+    if let Err(err) = speech.finish_dialog(turn_id).await {
+        match cause {
+            InterruptCause::Wake => {
+                debug!(turn_id, error = %err, "旧 turn 已被新唤醒取代，finish_dialog 按 stale 跳过")
+            }
+            _ => warn!(turn_id, error = %err, "中断收尾时 finish_dialog 失败"),
+        }
+    }
+    state.agent.reset_session(cause.reason()).await;
 }
 
 #[derive(Clone)]
@@ -199,8 +275,8 @@ async fn run_turn(
     speech: SpeechHandle,
     first_turn: SpeechTurn,
     followup_rx: mpsc::Receiver<SpeechTurn>,
+    active_turn_id: Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
-    let active_turn_id = Arc::new(AtomicU64::new(first_turn.id()));
     let result = run_session(
         state.clone(),
         speech.clone(),
@@ -210,10 +286,15 @@ async fn run_turn(
     )
     .await;
     if result.is_err() {
-        let _ = speech
-            .finish_dialog(active_turn_id.load(Ordering::Relaxed))
-            .await;
-        state.agent.reset_session("turn failed").await;
+        // 采集/ASR/LLM/TTS 任何一环中途失败都从这里收尾：run_session 里的
+        // 采集错误不再各自重复 finish_dialog，只在这一处发一次。
+        interrupt_turn(
+            &state,
+            &speech,
+            active_turn_id.load(Ordering::Relaxed),
+            InterruptCause::Failure("turn failed"),
+        )
+        .await;
     }
     cleanup_turn_leds(&state.device, &state.config.device).await;
     state.music.restore_after_interruption().await;
@@ -278,8 +359,7 @@ async fn run_session(
                     Err(err) if is_capture_timeout(&err) => {
                         stream.close().await;
                         info!(turn_id, "session idle timeout");
-                        speech.finish_dialog(turn_id).await?;
-                        state.agent.reset_session("session idle timeout").await;
+                        interrupt_turn(&state, &speech, turn_id, InterruptCause::IdleTimeout).await;
                         return Ok(());
                     }
                     Err(err) => {
@@ -318,8 +398,7 @@ async fn run_session(
                     Err(err) if is_capture_timeout(&err) => {
                         stream.close().await;
                         info!(turn_id, "session idle timeout");
-                        speech.finish_dialog(turn_id).await?;
-                        state.agent.reset_session("session idle timeout").await;
+                        interrupt_turn(&state, &speech, turn_id, InterruptCause::IdleTimeout).await;
                         return Ok(());
                     }
                     Err(err) => {
@@ -353,8 +432,7 @@ async fn run_session(
                     Ok(pcm) => pcm,
                     Err(err) if is_capture_timeout(&err) => {
                         info!(turn_id, "session idle timeout");
-                        speech.finish_dialog(turn_id).await?;
-                        state.agent.reset_session("session idle timeout").await;
+                        interrupt_turn(&state, &speech, turn_id, InterruptCause::IdleTimeout).await;
                         return Ok(());
                     }
                     Err(err) => return Err(err),
@@ -403,7 +481,7 @@ async fn run_session(
         }
 
         speech.continue_dialog(turn_id).await?;
-        request_followup_capture().await?;
+        request_followup_capture(&state.device).await?;
         state.device.shut_led(led.led_speaking).await;
         state.device.show_led(led.led_listening).await;
         turn = match timeout(idle_timeout, followup_rx.recv()).await {
@@ -415,24 +493,22 @@ async fn run_session(
             }
             Err(_) => {
                 info!(turn_id, "timed out waiting for follow-up stream");
-                speech.finish_dialog(turn_id).await?;
-                state.agent.reset_session("session idle timeout").await;
+                interrupt_turn(&state, &speech, turn_id, InterruptCause::IdleTimeout).await;
                 return Ok(());
             }
         };
     }
 }
 
-async fn request_followup_capture() -> anyhow::Result<()> {
+async fn request_followup_capture(device: &Device) -> anyhow::Result<()> {
     // Let mipns process DialogFinish and return to idle before asking its
     // public mic-open path to start a real multi-round VPM stream.
     sleep(Duration::from_millis(100)).await;
-    let result = crate::shell::run_shell(
-        r#"ubus -t 1 -S call pnshelper event_notify '{"src":1,"event":0}'"#,
-        Duration::from_secs(10),
-    )
-    .await
-    .map_err(|err| anyhow::anyhow!("failed to request follow-up capture: {err}"))?;
+    let script = r#"ubus -t 1 -S call pnshelper event_notify '{"src":1,"event":0}'"#;
+    let result = device
+        .run_raw(script, Duration::from_secs(10))
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to request follow-up capture: {err}"))?;
     if result.exit_code != 0 {
         anyhow::bail!(
             "pnshelper follow-up request failed exit={} stderr={}",
