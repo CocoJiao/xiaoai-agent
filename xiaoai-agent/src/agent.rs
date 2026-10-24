@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use rig_core::client::CompletionClient;
-use rig_core::completion::Prompt;
+use rig_core::completion::{Message, Prompt};
 use rig_core::providers::{anthropic, openai};
 use rig_core::tool::server::{ToolServer, ToolServerHandle};
 use serde_json::{json, Value};
@@ -84,8 +84,55 @@ pub struct AgentRuntime {
     config: Arc<AppConfig>,
     tool_server: ToolServerHandle,
     _mcp: McpConnections,
-    history: Mutex<Vec<(String, String)>>,
+    history: Mutex<Vec<HistoryTurn>>,
     control: Arc<Mutex<AgentControl>>,
+}
+
+/// 一轮问答的结构化历史。
+///
+/// 只存「用户说了什么 / 助手答了什么」两条文本，发请求时再转换成 rig 的
+/// `Message`。不直接存 `Message` 是为了让截断策略（轮数 + 字符数）能作用在
+/// 可读文本上，而不是在 `OneOrMany<Content>` 里翻找。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistoryTurn {
+    user: String,
+    assistant: String,
+}
+
+impl HistoryTurn {
+    fn chars(&self) -> usize {
+        self.user.chars().count() + self.assistant.chars().count()
+    }
+}
+
+/// 历史最多保留 10 轮问答；同时限制总字符数，避免长回答把上下文吃掉。
+/// 两者取先到者，超出的从最旧的一轮开始丢。
+const HISTORY_MAX_TURNS: usize = 10;
+const HISTORY_MAX_CHARS: usize = 4000;
+
+/// 按「轮数 + 字符数」双上限裁剪历史。
+///
+/// 字符数裁剪至少保留一轮：一轮就超预算时，宁可留这一轮，也不要让模型在
+/// 连续追问里彻底失忆（「它刚才说的那个」这类指代会当场断掉）。
+fn trim_history(turns: &mut Vec<HistoryTurn>) {
+    while turns.len() > HISTORY_MAX_TURNS {
+        turns.remove(0);
+    }
+    let mut total: usize = turns.iter().map(HistoryTurn::chars).sum();
+    while total > HISTORY_MAX_CHARS && turns.len() > 1 {
+        total -= turns[0].chars();
+        turns.remove(0);
+    }
+}
+
+/// 把历史展开成 rig 能直接发出去的消息序列（user / assistant 交替）。
+fn history_to_messages(turns: &[HistoryTurn]) -> Vec<Message> {
+    let mut messages = Vec::with_capacity(turns.len() * 2);
+    for turn in turns {
+        messages.push(Message::user(turn.user.clone()));
+        messages.push(Message::assistant(turn.assistant.clone()));
+    }
+    messages
 }
 
 impl AgentRuntime {
@@ -163,8 +210,9 @@ impl AgentRuntime {
             message.to_string()
         };
 
-        let prompt = self.prompt_with_history(&message_with_time).await;
-        let text = self.prompt_once(prompt).await?;
+        // 历史按结构化消息传给模型，不再拼成「最近对话历史：…」那一段文字。
+        let history = self.history_snapshot().await;
+        let text = self.prompt_once(message_with_time, history).await?;
 
         let control = self.control.lock().await;
         self.push_history(message, &text).await;
@@ -210,15 +258,15 @@ impl AgentRuntime {
         )
     }
 
-    async fn prompt_once(&self, prompt: String) -> anyhow::Result<String> {
+    async fn prompt_once(&self, prompt: String, history: Vec<Message>) -> anyhow::Result<String> {
         let http_client = reqwest::Client::builder()
             .timeout(timeout_duration(self.config.llm.timeout_s))
             .build()
             .context("failed to create LLM HTTP client")?;
 
         match self.config.llm.protocol {
-            LlmProtocol::OpenAiChat => self.prompt_openai(http_client, prompt).await,
-            LlmProtocol::Anthropic => self.prompt_anthropic(http_client, prompt).await,
+            LlmProtocol::OpenAiChat => self.prompt_openai(http_client, prompt, history).await,
+            LlmProtocol::Anthropic => self.prompt_anthropic(http_client, prompt, history).await,
         }
     }
 
@@ -226,6 +274,7 @@ impl AgentRuntime {
         &self,
         http_client: reqwest::Client,
         prompt: String,
+        history: Vec<Message>,
     ) -> anyhow::Result<String> {
         let client = openai::Client::builder()
             .api_key(self.config.llm.api_key.as_str())
@@ -245,13 +294,19 @@ impl AgentRuntime {
             .tool_server_handle(self.tool_server.clone())
             .build();
 
-        Ok(agent.prompt(prompt).await?.trim().to_string())
+        // 历史以结构化消息挂到请求上；空历史不必多挂一层。
+        let mut request = agent.prompt(prompt);
+        if !history.is_empty() {
+            request = request.with_history(history);
+        }
+        Ok(request.await?.trim().to_string())
     }
 
     async fn prompt_anthropic(
         &self,
         http_client: reqwest::Client,
         prompt: String,
+        history: Vec<Message>,
     ) -> anyhow::Result<String> {
         // 老版 Claude 要求 1024 <= budget_tokens < max_tokens；默认配置是
         // budget 1024 / max_tokens 300，直接开 thinking 会每轮失败并播"大模型服务遇到问题"。
@@ -302,7 +357,12 @@ impl AgentRuntime {
         }
         let agent = builder.tool_server_handle(self.tool_server.clone()).build();
 
-        Ok(agent.prompt(prompt).await?.trim().to_string())
+        // 历史以结构化消息挂到请求上；空历史不必多挂一层。
+        let mut request = agent.prompt(prompt);
+        if !history.is_empty() {
+            request = request.with_history(history);
+        }
+        Ok(request.await?.trim().to_string())
     }
 
     pub async fn reset_session(&self, reason: &str) {
@@ -312,27 +372,22 @@ impl AgentRuntime {
         control.end_reason = reason.to_string();
     }
 
-    async fn prompt_with_history(&self, message: &str) -> String {
-        let history = self.history.lock().await;
-        if history.is_empty() {
-            return message.to_string();
-        }
-        let mut prompt = String::from("最近对话历史：\n");
-        for (role, text) in history.iter() {
-            prompt.push_str(role);
-            prompt.push('：');
-            prompt.push_str(text);
-            prompt.push('\n');
-        }
-        prompt.push_str("当前用户：");
-        prompt.push_str(message);
-        prompt
+    /// 取一份历史快照，转成 rig 的消息序列。
+    ///
+    /// 拿的是克隆而不是锁本身：请求期间不能一直占着 `history`，否则同一轮里
+    /// 的 `push_history` 会等到请求结束才写进去。
+    async fn history_snapshot(&self) -> Vec<Message> {
+        let turns = self.history.lock().await;
+        history_to_messages(&turns)
     }
 
     async fn push_history(&self, user: &str, assistant: &str) {
         let mut history = self.history.lock().await;
-        history.push(("用户".to_string(), user.to_string()));
-        history.push(("助手".to_string(), assistant.to_string()));
+        history.push(HistoryTurn {
+            user: user.to_string(),
+            assistant: assistant.to_string(),
+        });
+        trim_history(&mut history);
     }
 }
 
@@ -359,9 +414,81 @@ fn anthropic_thinking_params(mode: &LlmThinkingMode, budget_tokens: u64) -> Valu
 
 #[cfg(test)]
 mod tests {
-    use super::{anthropic_thinking_params, openai_thinking_params};
+    use super::{
+        anthropic_thinking_params, history_to_messages, openai_thinking_params, trim_history,
+        HistoryTurn, HISTORY_MAX_CHARS, HISTORY_MAX_TURNS,
+    };
     use crate::config::LlmThinkingMode;
+    use rig_core::completion::Message;
     use serde_json::json;
+
+    fn turn(user: &str, assistant: &str) -> HistoryTurn {
+        HistoryTurn {
+            user: user.to_string(),
+            assistant: assistant.to_string(),
+        }
+    }
+
+    #[test]
+    fn history_is_sent_as_structured_messages() {
+        // 回归：历史曾经被拼成「最近对话历史：\n用户：…\n助手：…」一整段文字塞进
+        // 用户消息，导致重复计费、模型把旧话当新指令。
+        let turns = vec![
+            turn("今天天气怎么样", "晴，22 度"),
+            turn("那明天呢", "明天有小雨"),
+        ];
+        let messages = history_to_messages(&turns);
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(&messages[0], Message::User { .. }));
+        assert!(matches!(&messages[1], Message::Assistant { .. }));
+        assert!(matches!(&messages[2], Message::User { .. }));
+        assert!(matches!(&messages[3], Message::Assistant { .. }));
+    }
+
+    #[test]
+    fn trim_history_drops_oldest_turns_beyond_the_turn_limit() {
+        let mut turns = (0..HISTORY_MAX_TURNS + 3)
+            .map(|index| turn(&format!("问{index}"), &format!("答{index}")))
+            .collect::<Vec<_>>();
+        trim_history(&mut turns);
+        assert_eq!(turns.len(), HISTORY_MAX_TURNS);
+        // 留下的必须是最近的，最旧的三轮要丢掉
+        assert_eq!(turns[0].user, "问3");
+        assert_eq!(
+            turns.last().map(|turn| turn.user.clone()),
+            Some(format!("问{}", HISTORY_MAX_TURNS + 2))
+        );
+    }
+
+    #[test]
+    fn trim_history_drops_oldest_turns_beyond_the_char_budget() {
+        // 每轮 1000 字符，5 轮就超过 4000 的预算 → 只应留 4 轮
+        let mut turns = (0..5)
+            .map(|index| {
+                turn(
+                    &format!("{index}").repeat(500),
+                    &format!("{index}").repeat(500),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(turns.iter().map(HistoryTurn::chars).sum::<usize>(), 5000);
+        trim_history(&mut turns);
+        assert_eq!(turns.len(), 4);
+        assert!(turns.iter().map(HistoryTurn::chars).sum::<usize>() <= HISTORY_MAX_CHARS);
+        assert!(
+            turns[0].user.starts_with('1'),
+            "最旧的一轮（以 0 开头）应被丢弃"
+        );
+    }
+
+    #[test]
+    fn trim_history_keeps_a_single_oversized_turn() {
+        // 一轮就超预算时不能把历史清空到「连这轮都没有」——宁可留一条，
+        // 也不要让模型在连续追问里完全失忆。
+        let mut turns = vec![turn(&"问".repeat(3000), &"答".repeat(3000))];
+        trim_history(&mut turns);
+        assert_eq!(turns.len(), 1);
+    }
 
     #[test]
     fn disables_thinking_for_anthropic_messages() {
