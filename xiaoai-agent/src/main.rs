@@ -538,9 +538,26 @@ async fn yield_after_consecutive_failures(
         );
         return Some(1);
     }
-    warn!("故障让位未成功，继续运行；连续失败计数已清零，攒够再试");
-    failures.store(0, Ordering::Relaxed);
-    None
+    // 只有「脚本根本没动前端」（锁被占用 / launcher 不可执行）才允许继续运行。
+    // 其余（4 = pns/watchdog 已停但 mico 没停、5 = 保护没卸或原生没恢复）都已经
+    // 动过前端：此时继续跑表现为「LED 正常闪、进程正常在、麦克风不工作、
+    // watchdog 已停」，比 exit(1) 更难被发现，所以一律退出。
+    if outcome.exit_code == Some(LAUNCHER_EXIT_UNTOUCHED) {
+        warn!("让位命令未执行（launcher 锁被占用等），前端未受影响，继续运行；连续失败计数清零");
+        failures.store(0, Ordering::Relaxed);
+        return None;
+    }
+    if outcome.exit_code == Some(LAUNCHER_EXIT_HALF_DISMANTLED) {
+        error!(
+            "让位命令报告原生服务未起来（exit=5）：inode 已换回原生，但 mico/pns 不可用，判失败退出"
+        );
+    } else {
+        error!(
+            exit = ?outcome.exit_code,
+            "让位失败且前端可能已被拆开：判失败退出，避免「看起来一切正常但麦克风不工作」"
+        );
+    }
+    Some(1)
 }
 
 /// 把一次重载丢到后台跑。
@@ -668,10 +685,24 @@ fn launcher_path() -> Option<PathBuf> {
 /// 交出去了吗」。只看前者会误判——launcher 可能因为「杀不掉 agent」在收尾阶段
 /// 返回非 0，而原生前端早已恢复；调过来也一样，脚本成功但 socket 还在我们手里
 /// 就绝不能当成功。
+/// `start-agent.sh stop` 的「前端一点没动」退出码（锁被占用等）。
+///
+/// 契约在 `start-agent.sh` 顶部：0 成功 / 3 未受影响 / 4 半哑 / 5 拆到一半。
+/// 只有 3 允许继续运行——其余都意味着前端已经被动过，继续跑会表现为
+/// 「LED 正常闪、麦克风不工作」。
+const LAUNCHER_EXIT_UNTOUCHED: i32 = 3;
+/// `restore_native_files` 之后还有两步（`start_native_mico` / `pns start`）。
+/// 它们失败时 **inode 已经换回原生的了**，但 mico/pns 没跑起来——socket 在位、
+/// 麦克风不工作。这是唯一一个「inode 事实说成功、脚本自述说失败」的格子，
+/// 必须以脚本为准，所以它的判定要排在 `succeeded()` 之前。
+const LAUNCHER_EXIT_HALF_DISMANTLED: i32 = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct YieldOutcome {
     issued: bool,
     taken_over: bool,
+    /// 脚本真实退出码（没跑起来 / 超时则为 None）。
+    exit_code: Option<i32>,
     /// 命令超时（脚本可能仍停在还原中途）。超时是「脚本正在跑」的最强信号，
     /// 此时任何 inode 快照都不可靠，不能当成「什么都没发生」。
     timed_out: bool,
@@ -679,7 +710,19 @@ struct YieldOutcome {
 
 impl YieldOutcome {
     /// 让位是否达成：命令成功，或者事实上已经被接管走。
+    ///
+    /// 但 `exit 5`（脚本自述「原生服务没起来」）**压过 inode 事实**：那两格
+    /// （`start_native_mico` / `pns start`）发生在 `rm` + `mv` **之后**，inode 已经
+    /// 换回原生的了，但 mico/pns 没跑——socket 在位、麦克风不工作。脚本比 inode
+    /// 知道得多，所以这一档以脚本为准。
+    ///
+    /// 这条规则必须放在这里而不是某个调用点：`succeeded()` 有三个调用点
+    /// （`Fatal` ×2、连续失败 ×1），规则写在外面就要求三处各自解释一遍，
+    /// 而漏掉的那处恰好是更常走的 `Fatal` 路径。
     fn succeeded(&self) -> bool {
+        if self.exit_code == Some(LAUNCHER_EXIT_HALF_DISMANTLED) {
+            return false;
+        }
         self.issued || self.taken_over
     }
 }
@@ -699,6 +742,7 @@ async fn yield_to_native(
             issued: false,
             taken_over: ownership.taken_over(),
             timed_out: false,
+            exit_code: None,
         };
     };
     let script = format!(
@@ -713,9 +757,11 @@ async fn yield_to_native(
     // 走 detached 通道：还原序列必须能跑完。用普通通道的话，180s 超时会连带
     // 杀掉正在 restore 的 /bin/sh，停在「保护已卸、原生 socket 还没 mv 回」的中间态。
     let mut timed_out = false;
+    let mut exit_code = None;
     let issued = match device.run_detached(&script, Duration::from_secs(180)).await {
         Ok(result) if result.exit_code == 0 => {
             info!("launcher stop 已执行，原厂前端应当已恢复");
+            exit_code = Some(0);
             true
         }
         Ok(result) => {
@@ -724,6 +770,7 @@ async fn yield_to_native(
                 stderr = result.stderr.trim(),
                 "让位命令执行失败"
             );
+            exit_code = Some(result.exit_code);
             false
         }
         Err(err) => {
@@ -762,6 +809,7 @@ async fn yield_to_native(
         issued,
         taken_over,
         timed_out,
+        exit_code,
     }
 }
 
@@ -1482,6 +1530,77 @@ mod tests {
         let _ = std::fs::remove_file(owned.path());
     }
 
+    /// 已经动过前端（4 = pns/watchdog 停了但 mico 没停；5 = 保护没卸或原生没恢复）
+    /// 必须退出：此时继续跑的表现是「LED 正常闪、麦克风不工作、watchdog 已停」。
+    #[tokio::test]
+    async fn consecutive_failures_exit_when_the_launcher_stopped_halfway() {
+        for exit in [4_i32, 5, 1] {
+            let shell = Arc::new(RecordingShell::exiting_with(exit, "restore failed"));
+            let device = Device::with_runner(DeviceConfig::default(), shell);
+            let failures = Arc::new(AtomicU32::new(YIELD_AFTER_CONSECUTIVE_FAILURES));
+            let owned = still_owned_socket(&format!("streak-half-{exit}"));
+
+            let code = yield_after_consecutive_failures(
+                &device,
+                Some(Path::new("/data/open-xiaoai/start-agent.sh")),
+                &owned,
+                &failures,
+            )
+            .await;
+
+            assert_eq!(code, Some(1), "退出码 {exit} 说明前端已被动过，必须退出");
+            let _ = std::fs::remove_file(owned.path());
+        }
+    }
+
+    /// `exit 5` 必须压过「inode 已换」：`rm` + `mv` 成功后 mico/pns 没起来，
+    /// socket 在位但麦克风不工作——这条在当前实现下曾经返回 `Some(0)`。
+    #[tokio::test]
+    async fn exit_code_5_beats_a_replaced_inode() {
+        let shell = Arc::new(RecordingShell::exiting_with(
+            LAUNCHER_EXIT_HALF_DISMANTLED,
+            "failed to restart native mico",
+        ));
+        let device = Device::with_runner(DeviceConfig::default(), shell);
+        let failures = Arc::new(AtomicU32::new(YIELD_AFTER_CONSECUTIVE_FAILURES));
+        let taken = taken_over_socket("half-dismantled");
+
+        let code = yield_after_consecutive_failures(
+            &device,
+            Some(Path::new("/x/start-agent.sh")),
+            &taken,
+            &failures,
+        )
+        .await;
+
+        assert_eq!(
+            code,
+            Some(1),
+            "inode 换了但原生服务没起来，不能算成功（退出码 0 = 哑且无任何信号）"
+        );
+        let _ = std::fs::remove_file(taken.path());
+    }
+
+    /// `succeeded()` 是「让位是否达成」的唯一答案：`exit 5` 必须压过 inode 事实。
+    /// 三个调用点（Fatal ×2、连续失败 ×1）共用这一条，钉住它就等于三处都钉住。
+    #[test]
+    fn exit_code_5_is_never_success_even_with_a_replaced_inode() {
+        let half = YieldOutcome {
+            issued: false,
+            taken_over: true,
+            timed_out: false,
+            exit_code: Some(LAUNCHER_EXIT_HALF_DISMANTLED),
+        };
+        assert!(!half.succeeded(), "inode 换了但原生服务没起来，不能算成功");
+
+        // 对照：同一个「inode 已换」的事实，脚本说成功时才算成功。
+        let restored = YieldOutcome {
+            exit_code: Some(0),
+            ..half
+        };
+        assert!(restored.succeeded());
+    }
+
     /// 让位**超时**不能算「脚本没动前端」：脚本可能正停在还原中途，此时
     /// watchdog 已停、保护已卸，继续运行会表现为「LED 正常闪但麦克风不工作」。
     #[tokio::test]
@@ -1509,10 +1628,11 @@ mod tests {
         let _ = std::fs::remove_file(owned.path());
     }
 
+    /// 只有「脚本根本没动前端」（锁被占用，退出码 3）才继续运行。
     #[tokio::test]
-    async fn consecutive_failures_keep_running_when_the_yield_failed() {
+    async fn consecutive_failures_keep_running_only_when_the_frontend_is_untouched() {
         let shell = Arc::new(RecordingShell::exiting_with(
-            1,
+            LAUNCHER_EXIT_UNTOUCHED,
             "another launcher operation is in progress",
         ));
         let device = Device::with_runner(DeviceConfig::default(), shell);
@@ -1529,7 +1649,7 @@ mod tests {
 
         assert_eq!(
             code, None,
-            "让位失败时不能退出：退出会留下「哑 + watchdog 已停」"
+            "前端未受影响时不该退出：让位这次没跑起来而已，麦克风还在我们手里"
         );
         assert_eq!(
             failures.load(Ordering::Relaxed),
