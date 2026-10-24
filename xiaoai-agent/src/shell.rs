@@ -10,6 +10,12 @@ use crate::base::AppError;
 /// 没有超时就会把整轮对话永久挂住。
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 超时错误的固定前缀。
+///
+/// 单独提出来是为了让「测试断言」和「错误文案」绑在同一个常量上：改文案时不会
+/// 出现「测试仍然通过、但再也测不到超时」这种静默失效。
+pub const TIMEOUT_ERROR_PREFIX: &str = "shell command timed out";
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CommandResult {
     pub stdout: String,
@@ -30,7 +36,7 @@ pub async fn run_shell(script: &str, limit: Duration) -> Result<CommandResult, A
         Ok(res) => res?,
         Err(_) => {
             let brief: String = script.chars().take(80).collect();
-            return Err(format!("shell command timed out after {limit:?}: {brief}").into());
+            return Err(format!("{TIMEOUT_ERROR_PREFIX} after {limit:?}: {brief}").into());
         }
     };
 
@@ -91,7 +97,10 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("timed out"), "错误信息应说明超时: {err}");
+        assert!(
+            err.contains(TIMEOUT_ERROR_PREFIX),
+            "错误信息应说明超时（断言绑在 TIMEOUT_ERROR_PREFIX 上，改文案不会静默失效）: {err}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "超时后必须立刻返回，实际耗时 {:?}",
@@ -104,7 +113,10 @@ mod tests {
         // 回归（PR #8 的 kill_on_drop）：唤醒打断时会 abort 本轮任务，
         // sh 必须跟着死，否则旧 TTS 会和新回答叠着播。
         //
-        // 注意：这里只保证直接子进程（sh）被回收。sh 里再 fork 出去的孙进程
+        // 注意 1：本测试靠 /proc/<pid> 判断存活，**只在 Linux 上真实有效**；
+        // 换到没有 /proc 的平台会变成空跑通过（本 crate 在 Windows 上本来就编不过，
+        // 但移植时要记得换一种存活判定）。
+        // 注意 2：这里只保证直接子进程（sh）被回收。sh 里再 fork 出去的孙进程
         // （tts_play.sh 内部的播放器）**不保证**跟着死——这正是 issue #6 要
         // 用 playback_token 解决的那一类问题，不要把这个测试当成孙进程安全。
         let tag = "drop";
