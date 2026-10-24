@@ -76,6 +76,17 @@ Rules:
   xiaoai again and stays that way until a human runs `start-agent.sh start`.
   That is the intent: a speaker that answers as native xiaoai is better than one
   that can be woken but never answers.
+- "Did the yield actually hand the microphone back?" is decided by a **fact**, not
+  by the launcher's exit code: `SpeechService::ownership()` remembers the inode of
+  the socket it bound, and `SocketOwnership::taken_over()` checks whether the path
+  still resolves to it. The restore sequence `mv`s the native socket back, so the
+  inode changes — and the launcher may return non-zero ("could not kill the agent")
+  *after* the native frontend is already serving. Neither signal alone is correct.
+- The yield command runs through `ShellRunner::run_detached` / `Device::run_detached`
+  (no `kill_on_drop`). On the normal `run` path a 180 s timeout would kill the
+  `sh` that is halfway through `restore_native_frontend`, leaving the takeover
+  half-dismantled. Never route TTS/playback through the detached path: those must
+  die with the turn.
 - Known gap, tracked in issue #13: a single `speech.usock` send/recv error still
   escalates to `SpeechServiceEvent::Fatal`. Grading those errors (warn and
   continue for recoverable `errno`s, fatal only for an unusable socket) needs
