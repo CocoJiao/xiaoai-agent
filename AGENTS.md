@@ -69,6 +69,22 @@ Rules:
   takeover: getting the microphone back requires a full `start-agent.sh start`
   (pns override, protected `mico` restart, `pnshelper` follow-up request), not a
   binary restart.
+- A speech-service loop error is **not** instantly fatal. `supervise_service`
+  restarts the receive loop on the *same* socket and with the *same*
+  `ServiceState` (registered peer, current turn, counters) up to three times with
+  a 200 ms / 1 s / 3 s backoff; only then does it emit
+  `SpeechServiceEvent::Fatal`. Re-binding is not an option there: the launcher
+  keeps `speech.usock` bind-mounted, so the agent cannot unlink it.
+- Who exits, and when:
+  - `Fatal` / the event channel closing = the frontend is gone. Yield, then exit
+    (code 0 if the yield succeeded, 1 if it did not) — staying alive serves nobody.
+  - **Consecutive turn failures** = the frontend is still alive, it just cannot
+    answer. Yield; if the yield did not succeed, **keep running** and reset the
+    counter instead of exiting: exiting there leaves a mute speaker with the
+    watchdog already stopped (`stop_watchdog` runs early in the restore sequence).
+    Do not retry the yield immediately — a second `start-agent.sh stop` usually
+    fails for the same reason (the launcher lock, or an unkillable agent) and turns
+    into repeated stop/start of the native services.
 - Both sides funnel through the launcher's `launcher.lock` (`mkdir` lock). When
   the lock is held, the loser logs and returns; it must not retry in a loop, or
   the two recoveries will race each other.

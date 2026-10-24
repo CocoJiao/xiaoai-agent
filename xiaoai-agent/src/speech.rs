@@ -6,10 +6,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{anyhow, bail, Context};
 use bytes::Bytes;
 use rand::RngCore;
+use std::time::Duration;
+
 use tokio::net::UnixDatagram;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio::time::{sleep, Instant};
 use tracing::{debug, info, warn};
 
 const DEFAULT_SOCKET_PATH: &str = "/tmp/mico_aivs_lab/usock/speech.usock";
@@ -279,14 +282,7 @@ impl SpeechService {
         let (command_tx, command_rx) = mpsc::channel(16);
         let handle = SpeechHandle { command_tx };
         let task_handle = handle.clone();
-        let task_event_tx = event_tx.clone();
-        let task = tokio::spawn(async move {
-            if let Err(err) = run_service(socket, event_tx, command_rx, task_handle).await {
-                let _ = task_event_tx
-                    .send(SpeechServiceEvent::Fatal(format!("{err:#}")))
-                    .await;
-            }
-        });
+        let task = tokio::spawn(supervise_service(socket, event_tx, command_rx, task_handle));
 
         info!(socket = %socket_path.display(), "speech.usock service listening");
         Ok(Self {
@@ -395,13 +391,94 @@ struct ServiceState {
     dialog_count: u64,
 }
 
-async fn run_service(
+/// 收包循环的**连续**重启上限。取 3：连续三次都起不来，说明不是瞬时抖动。
+///
+/// 注意是「连续」不是「累计」：agent 会跑几天到几周，若按累计计数，一次每天
+/// 偶发的协议错误会在第 4 天把进程判成 Fatal——那等于把「一次抖动就上」改成
+/// 「第 4 次抖动上」，对长期稀疏抖动毫无保护，还更难察觉（前三次只是 warn）。
+const MAX_SERVICE_RESTARTS: u32 = 3;
+
+/// 上一次重启之后循环稳定跑了这么久，就认为那是独立的、新的一次抖动 → 重新计数。
+/// 60 秒：一次正常唤醒对话是几秒到几十秒，跑过 60s 说明循环确实是稳的。
+const STABLE_SERVICE_THRESHOLD: Duration = Duration::from_secs(60);
+
+/// 这一轮循环活得够久、可以把重启计数清零吗。
+fn should_reset_restart_count(lived: Duration) -> bool {
+    lived >= STABLE_SERVICE_THRESHOLD
+}
+
+fn restart_delay(attempt: u32) -> Duration {
+    match attempt {
+        1 => Duration::from_millis(200),
+        2 => Duration::from_secs(1),
+        _ => Duration::from_secs(3),
+    }
+}
+
+/// 服务任务的监督者：收包循环出错就**在原地重启**它，而不是立刻把整个 agent
+/// 判成致命故障。
+///
+/// 为什么能原地重启：socket 的 fd 和 `ServiceState`（注册的 peer、当前 turn、
+/// turn 计数器）都留在这一层，重启只是重新进循环——不需要重新 bind，也不会丢掉
+/// mipns 的注册状态。这一点很关键：设备上 speech.usock 被 launcher 用
+/// bind-mount 保护着，agent 侧根本 unlink 不掉，想「重新 bind」是行不通的。
+///
+/// 为什么要重启：一次瞬时协议错误（对面发了个畸形的包导致处理链返回 Err、
+/// 或某个 send 失败）在重启前会把整个进程判成 Fatal → 让位 → 音箱回原厂。
+/// 那对「一次抖动」来说代价太大；先重启 3 次（200ms / 1s / 3s 退避），
+/// 仍失败才 Fatal。
+async fn supervise_service(
     socket: UnixDatagram,
     event_tx: mpsc::Sender<SpeechServiceEvent>,
     mut command_rx: mpsc::Receiver<ServiceCommand>,
     handle: SpeechHandle,
-) -> anyhow::Result<()> {
+) {
     let mut state = ServiceState::default();
+    let mut restarts = 0_u32;
+    let fatal = loop {
+        let started = Instant::now();
+        match run_service(&socket, &event_tx, &mut command_rx, &mut state, &handle).await {
+            // 命令通道关闭 = 主程序已经走了，正常退出。
+            Ok(()) => break None,
+            Err(err) => {
+                let lived = started.elapsed();
+                if should_reset_restart_count(lived) {
+                    debug!(
+                        lived_s = lived.as_secs(),
+                        "收包循环稳定运行过一段时间，重启计数清零（这是新的一次抖动）"
+                    );
+                    restarts = 0;
+                }
+                restarts += 1;
+                if restarts > MAX_SERVICE_RESTARTS {
+                    break Some(err);
+                }
+                let delay = restart_delay(restarts);
+                warn!(
+                    attempt = restarts,
+                    limit = MAX_SERVICE_RESTARTS,
+                    delay_ms = delay.as_millis() as u64,
+                    error = %err,
+                    "speech.usock 收包循环出错，保留 socket 与注册状态原地重启"
+                );
+                sleep(delay).await;
+            }
+        }
+    };
+    if let Some(err) = fatal {
+        let _ = event_tx
+            .send(SpeechServiceEvent::Fatal(format!("{err:#}")))
+            .await;
+    }
+}
+
+async fn run_service(
+    socket: &UnixDatagram,
+    event_tx: &mpsc::Sender<SpeechServiceEvent>,
+    command_rx: &mut mpsc::Receiver<ServiceCommand>,
+    state: &mut ServiceState,
+    handle: &SpeechHandle,
+) -> anyhow::Result<()> {
     let mut buffer = vec![0_u8; MAX_DATAGRAM_SIZE];
 
     loop {
@@ -413,7 +490,7 @@ async fn run_service(
                     .context("mipns used an unnamed Unix datagram socket")?;
                 match decode_speech_upward(&buffer[..size]) {
                     Ok(Some(event)) => {
-                        handle_upward(&socket, &peer, &event_tx, &handle, &mut state, event).await?;
+                        handle_upward(socket, &peer, event_tx, handle, state, event).await?;
                     }
                     Ok(None) => debug!(bytes = size, "ignored non-upward speech message"),
                     Err(err) => warn!(bytes = size, error = %err, "ignored malformed speech message"),
@@ -423,7 +500,7 @@ async fn run_service(
                 let Some(command) = command else {
                     return Ok(());
                 };
-                let result = handle_command(&socket, &mut state, command.turn_id, command.kind).await;
+                let result = handle_command(socket, state, command.turn_id, command.kind).await;
                 let _ = command.result_tx.send(result);
             }
         }
@@ -986,6 +1063,139 @@ mod tests {
         assert_eq!(find_varint(&outer, 1), Some(SPEECH_TYPE_DOWNWARD));
         let downward = parse_fields(find_bytes(&outer, 3).unwrap()).unwrap();
         (find_varint(&downward, 1).unwrap(), downward)
+    }
+
+    /// 退避序列与重启上限是把「一次抖动」和「真坏了」分开的那条线，钉住它。
+    #[test]
+    fn restart_policy_backs_off_and_gives_up_after_three() {
+        assert_eq!(MAX_SERVICE_RESTARTS, 3);
+        assert_eq!(restart_delay(1), Duration::from_millis(200));
+        assert_eq!(restart_delay(2), Duration::from_secs(1));
+        assert_eq!(restart_delay(3), Duration::from_secs(3));
+    }
+
+    /// 「连续」而不是「累计」：稳定跑过门槛之后，重启计数必须清零。
+    #[test]
+    fn restart_count_resets_only_after_the_loop_stayed_stable() {
+        assert_eq!(STABLE_SERVICE_THRESHOLD, Duration::from_secs(60));
+        assert!(!should_reset_restart_count(Duration::from_secs(59)));
+        assert!(should_reset_restart_count(Duration::from_secs(60)));
+        assert!(should_reset_restart_count(Duration::from_secs(3600)));
+    }
+
+    /// 重启之后**注册状态必须还在**。
+    ///
+    /// 这条测试的探针是 `handle_upward` 开头那句「非注册包一律忽略」：先让正常
+    /// peer 注册成功（state.peer 被写），再制造一次协议错误触发重启，然后让同一个
+    /// peer 发一个**非注册**包——state 若在建时被重置，这个包会被当成未注册 peer
+    /// 丢掉，`recv_downward` 超时，断言红。
+    ///
+    /// （对比：只断言「重启后还能重新注册」是没用的——重建 state 后重新注册一样成功。）
+    #[tokio::test]
+    async fn restart_keeps_the_registered_peer_so_state_survives() {
+        let temp = std::env::temp_dir().join(format!(
+            "xiaoai-state-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&temp).unwrap();
+        let server_path = temp.join("speech.usock");
+        let client_path = temp.join("mipns.usock");
+        let mut service = SpeechService::bind(&server_path).await.unwrap();
+        let client = UnixDatagram::bind(&client_path).unwrap();
+
+        // 1) 注册成功（state.peer 写入），顺手把两条应答读完
+        client.send_to(&register(None), &server_path).await.unwrap();
+        assert_eq!(recv_downward(&client).await.0, DOWN_REGISTER_RESPONSE);
+        assert_eq!(recv_downward(&client).await.0, DOWN_ENABLE_VOICE_WAKEUP);
+        assert!(matches!(
+            service.recv().await,
+            Some(SpeechServiceEvent::Registered { .. })
+        ));
+
+        // 2) 制造一次协议错误：未命名 peer 发注册包 → 收包循环 Err → 原地重启
+        let unnamed = UnixDatagram::unbound().unwrap();
+        unnamed
+            .send_to(&register(None), &server_path)
+            .await
+            .unwrap();
+
+        // 3) 同一个 peer 发非注册包，重启后必须被接受
+        let mut handled = false;
+        for _ in 0..50 {
+            client
+                .send_to(&prepare(ACTIVATE_WAKEUP), &server_path)
+                .await
+                .unwrap();
+            if let Ok((kind, _)) =
+                tokio::time::timeout(Duration::from_millis(100), recv_downward(&client)).await
+            {
+                if kind == DOWN_STREAM_PREPARE_RESPONSE {
+                    handled = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            handled,
+            "重启后同一个 peer 的非注册包必须被接受：state 丢了就会被当成未注册 peer 丢掉"
+        );
+
+        drop(service);
+        drop(client);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    /// 一次协议层错误（这里是「未命名 peer」）不该让整条语音服务报 Fatal：
+    /// 监督者应当在**同一个 socket、同一份注册状态**上把收包循环重启起来，
+    /// 之后的正常 peer 仍然能注册成功。
+    #[tokio::test]
+    async fn service_survives_an_unnamed_peer_instead_of_going_fatal() {
+        let temp = std::env::temp_dir().join(format!(
+            "xiaoai-restart-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&temp).unwrap();
+        let server_path = temp.join("speech.usock");
+        let client_path = temp.join("mipns.usock");
+        let mut service = SpeechService::bind(&server_path).await.unwrap();
+
+        // 未 bind 直接 send_to：服务端拿不到 peer 的 pathname → 收包循环返回 Err。
+        let unnamed = UnixDatagram::unbound().unwrap();
+        unnamed
+            .send_to(&register(None), &server_path)
+            .await
+            .unwrap();
+        // 等第一次重启（200ms）走完。
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // 服务应当还活着：正常 peer 依然能注册并收到应答。
+        let client = UnixDatagram::bind(&client_path).unwrap();
+        client.send_to(&register(None), &server_path).await.unwrap();
+        assert_eq!(
+            recv_downward(&client).await.0,
+            DOWN_REGISTER_RESPONSE,
+            "重启后应当照常处理注册"
+        );
+        assert!(
+            matches!(
+                service.recv().await,
+                Some(SpeechServiceEvent::Registered { .. })
+            ),
+            "不该把一次协议错误升级成 Fatal"
+        );
+
+        drop(service);
+        drop(client);
+        fs::remove_dir_all(temp).unwrap();
     }
 
     /// 唯一正确的「已接管」证据：还原序列的 `mv` 让路径指向另一个 inode。

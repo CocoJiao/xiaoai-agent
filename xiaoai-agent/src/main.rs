@@ -35,6 +35,7 @@ use crate::capture::{
 use crate::config::{classify_config_change, AppConfig, ConfigChanges, ConfigHandle, DeviceConfig};
 use crate::device::Device;
 use crate::music::MusicService;
+use crate::shell::TIMEOUT_ERROR_PREFIX;
 use crate::speech::{SocketOwnership, SpeechHandle, SpeechService, SpeechServiceEvent, SpeechTurn};
 
 const ASR_SERVICE_ERROR_PROMPT: &str = "抱歉，语音识别服务遇到问题，请稍后重试";
@@ -244,20 +245,20 @@ async fn main() -> anyhow::Result<()> {
                     }
                     let streak = failures.load(Ordering::Relaxed);
                     if streak >= YIELD_AFTER_CONSECUTIVE_FAILURES {
-                        // 「能唤醒但答不上」已经连续出现整段会话。继续留在接管
-                        // 状态只会让用户一直对着一个不说话的音箱喊，让位更划算。
                         error!(
                             consecutive_failures = streak,
                             "连续多轮会话失败，故障让位给原厂小爱"
                         );
-                        let outcome = yield_to_native(
+                        if let Some(code) = yield_after_consecutive_failures(
                             &device,
                             launcher.as_deref(),
                             &ownership,
-                            "consecutive failures",
+                            &failures,
                         )
-                        .await;
-                        std::process::exit(if outcome.succeeded() { 0 } else { 1 });
+                        .await
+                        {
+                            std::process::exit(code);
+                        }
                     }
                     device
                         .blink_ready(initial.device.led_listening, Duration::from_millis(250))
@@ -496,6 +497,46 @@ impl Drop for ReloadGuard {
     }
 }
 
+/// 连续失败达到阈值后的处置：让位成功就退出，**没成功就继续跑**。
+///
+/// 这是「让位失败后的存活策略」里选的那一档（C-lite）：
+///
+/// - `Fatal` / 事件通道关闭 = 语音服务已经死了，留着也没用 → 让位后一律退出；
+/// - 连续会话失败 = 服务**还活着**（只是答不上来），此时退出会留下
+///   「哑 + watchdog 已被 stop_watchdog 停掉」的状态，比继续撑着更糟。
+///   所以让位没成功就把失败计数清零、继续服务，等下一次攒够再试。
+///
+/// 不做「立刻重试让位」：重试会再调一次 `start-agent.sh stop`，而它用 `mkdir`
+/// 锁和 watchdog 互斥；第一次因为「杀不掉 agent」失败的话第二次大概率同因失败，
+/// 结果是反复 stop/start 原生服务，比不动更糟。
+///
+/// 返回 `Some(退出码)` = 调用方应当退出；`None` = 继续跑。
+async fn yield_after_consecutive_failures(
+    device: &Device,
+    launcher: Option<&Path>,
+    ownership: &SocketOwnership,
+    failures: &Arc<AtomicU32>,
+) -> Option<i32> {
+    let outcome = yield_to_native(device, launcher, ownership, "consecutive failures").await;
+    if outcome.succeeded() {
+        return Some(0);
+    }
+    // 「让位失败」不是一种状态。超时意味着脚本可能正停在还原中途（保护已卸、
+    // 原生 socket 还没 mv 回），而 watchdog 早在 restore 第 2 步就被停了。
+    // 这种情况下继续运行 = LED 照常闪、进程照常在、但麦克风不工作、没人兜底，
+    // 比退出更难被发现。所以超时一律判失败退出，只有「脚本根本没动前端」
+    // 那一类（锁冲突、launcher 不存在等）才继续运行。
+    if outcome.timed_out {
+        error!(
+            "让位命令超时：脚本可能停在还原中途，判失败并退出（继续运行会表现为「一切正常但麦克风不工作」）"
+        );
+        return Some(1);
+    }
+    warn!("故障让位未成功，继续运行；连续失败计数已清零，攒够再试");
+    failures.store(0, Ordering::Relaxed);
+    None
+}
+
 /// 把一次重载丢到后台跑。
 ///
 /// 为什么不在主循环里 `await`：`agent.reload()` 里含 MCP 重连，单 server 上限
@@ -625,6 +666,9 @@ fn launcher_path() -> Option<PathBuf> {
 struct YieldOutcome {
     issued: bool,
     taken_over: bool,
+    /// 命令超时（脚本可能仍停在还原中途）。超时是「脚本正在跑」的最强信号，
+    /// 此时任何 inode 快照都不可靠，不能当成「什么都没发生」。
+    timed_out: bool,
 }
 
 impl YieldOutcome {
@@ -648,6 +692,7 @@ async fn yield_to_native(
         return YieldOutcome {
             issued: false,
             taken_over: ownership.taken_over(),
+            timed_out: false,
         };
     };
     let script = format!(
@@ -661,6 +706,7 @@ async fn yield_to_native(
     );
     // 走 detached 通道：还原序列必须能跑完。用普通通道的话，180s 超时会连带
     // 杀掉正在 restore 的 /bin/sh，停在「保护已卸、原生 socket 还没 mv 回」的中间态。
+    let mut timed_out = false;
     let issued = match device.run_detached(&script, Duration::from_secs(180)).await {
         Ok(result) if result.exit_code == 0 => {
             info!("launcher stop 已执行，原厂前端应当已恢复");
@@ -675,7 +721,8 @@ async fn yield_to_native(
             false
         }
         Err(err) => {
-            error!(error = %err, "让位命令没能执行");
+            timed_out = err.to_string().contains(TIMEOUT_ERROR_PREFIX);
+            error!(error = %err, timed_out, "让位命令没能执行");
             false
         }
     };
@@ -705,7 +752,11 @@ async fn yield_to_native(
         };
         warn!(socket = %ownership.path().display(), "{detail}");
     }
-    YieldOutcome { issued, taken_over }
+    YieldOutcome {
+        issued,
+        taken_over,
+        timed_out,
+    }
 }
 
 async fn reject_orphaned_turn(mut turn: SpeechTurn, speech: &SpeechHandle) {
@@ -1387,6 +1438,83 @@ mod tests {
         assert!(outcome.issued);
         assert!(!outcome.taken_over);
         assert!(outcome.succeeded(), "命令成功就算让位达成");
+        let _ = std::fs::remove_file(owned.path());
+    }
+
+    /// 连续失败后的处置：让位成功 → 退出；让位失败 → 继续跑（C-lite 策略）。
+    #[tokio::test]
+    async fn consecutive_failures_exit_only_when_the_yield_succeeded() {
+        let shell = Arc::new(RecordingShell::always_ok());
+        let device = Device::with_runner(DeviceConfig::default(), shell);
+        let failures = Arc::new(AtomicU32::new(YIELD_AFTER_CONSECUTIVE_FAILURES));
+        let owned = still_owned_socket("streak-exit");
+
+        let code = yield_after_consecutive_failures(
+            &device,
+            Some(Path::new("/data/open-xiaoai/start-agent.sh")),
+            &owned,
+            &failures,
+        )
+        .await;
+
+        assert_eq!(code, Some(0), "让位成功才退出");
+        let _ = std::fs::remove_file(owned.path());
+    }
+
+    /// 让位**超时**不能算「脚本没动前端」：脚本可能正停在还原中途，此时
+    /// watchdog 已停、保护已卸，继续运行会表现为「LED 正常闪但麦克风不工作」。
+    #[tokio::test]
+    async fn consecutive_failures_exit_when_the_yield_timed_out() {
+        let shell = Arc::new(RecordingShell::cannot_run(
+            "shell command timed out after 180s: /data/open-xiaoai/start-agent.sh stop",
+        ));
+        let device = Device::with_runner(DeviceConfig::default(), shell);
+        let failures = Arc::new(AtomicU32::new(YIELD_AFTER_CONSECUTIVE_FAILURES));
+        let owned = still_owned_socket("streak-timeout");
+
+        let code = yield_after_consecutive_failures(
+            &device,
+            Some(Path::new("/data/open-xiaoai/start-agent.sh")),
+            &owned,
+            &failures,
+        )
+        .await;
+
+        assert_eq!(
+            code,
+            Some(1),
+            "超时说明脚本可能停在还原中途，必须退出而不是假装健康"
+        );
+        let _ = std::fs::remove_file(owned.path());
+    }
+
+    #[tokio::test]
+    async fn consecutive_failures_keep_running_when_the_yield_failed() {
+        let shell = Arc::new(RecordingShell::exiting_with(
+            1,
+            "another launcher operation is in progress",
+        ));
+        let device = Device::with_runner(DeviceConfig::default(), shell);
+        let failures = Arc::new(AtomicU32::new(YIELD_AFTER_CONSECUTIVE_FAILURES));
+        let owned = still_owned_socket("streak-keep");
+
+        let code = yield_after_consecutive_failures(
+            &device,
+            Some(Path::new("/data/open-xiaoai/start-agent.sh")),
+            &owned,
+            &failures,
+        )
+        .await;
+
+        assert_eq!(
+            code, None,
+            "让位失败时不能退出：退出会留下「哑 + watchdog 已停」"
+        );
+        assert_eq!(
+            failures.load(Ordering::Relaxed),
+            0,
+            "计数必须清零，否则每个 tick 都会再试一次让位"
+        );
         let _ = std::fs::remove_file(owned.path());
     }
 
