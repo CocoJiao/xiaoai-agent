@@ -200,6 +200,48 @@ pub struct SpeechService {
     event_rx: mpsc::Receiver<SpeechServiceEvent>,
     task: JoinHandle<()>,
     socket_path: PathBuf,
+    /// 绑定时路径上的 inode，用于「让位之后这条路径还是不是我的」判断。
+    bound_inode: u64,
+}
+
+/// 「这个 speech socket 现在还是不是我绑的那一个」——一个事实判断，不是猜测。
+///
+/// 让位（`start-agent.sh stop`）会把原生 socket `mv` 回同一路径，inode 随之改变。
+/// 如果只看 launcher 的退出码，就会出现「其实已经让位成功、却当成失败」：脚本
+/// 可能因为「杀不掉 agent」在收尾阶段返回非 0，而原生前端早已恢复。
+pub struct SocketOwnership {
+    path: PathBuf,
+    inode: u64,
+}
+
+impl SocketOwnership {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 路径上还是本进程绑的那个 socket 吗。
+    pub fn still_owned(&self) -> bool {
+        read_inode(&self.path) == Some(self.inode)
+    }
+
+    /// 已被接管走：路径上的 socket 换了 inode，或者干脆不存在了（原生正在 mv 回来）。
+    pub fn taken_over(&self) -> bool {
+        !self.still_owned()
+    }
+
+    /// 测试用：直接按给定 inode 构造，不依赖真实 bind。
+    #[cfg(test)]
+    pub fn for_test(path: impl Into<PathBuf>, inode: u64) -> Self {
+        Self {
+            path: path.into(),
+            inode,
+        }
+    }
+}
+
+fn read_inode(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).ok().map(|meta| meta.ino())
 }
 
 impl SpeechService {
@@ -210,6 +252,12 @@ impl SpeechService {
         prepare_socket_path(&socket_path)?;
         let socket = UnixDatagram::bind(&socket_path)
             .with_context(|| format!("bind speech socket {}", socket_path.display()))?;
+        let bound_inode = read_inode(&socket_path).with_context(|| {
+            format!(
+                "read inode of the freshly bound speech socket {}",
+                socket_path.display()
+            )
+        })?;
 
         let (event_tx, event_rx) = mpsc::channel(16);
         let (command_tx, command_rx) = mpsc::channel(16);
@@ -230,11 +278,20 @@ impl SpeechService {
             event_rx,
             task,
             socket_path,
+            bound_inode,
         })
     }
 
     pub fn handle(&self) -> SpeechHandle {
         self.handle.clone()
+    }
+
+    /// 让位判断用的「我绑的是哪个 socket」快照。
+    pub fn ownership(&self) -> SocketOwnership {
+        SocketOwnership {
+            path: self.socket_path.clone(),
+            inode: self.bound_inode,
+        }
     }
 
     pub async fn recv(&mut self) -> Option<SpeechServiceEvent> {

@@ -114,6 +114,17 @@ impl Device {
         self.runner.run(script, limit).await
     }
 
+    /// 同 `run_raw`，但不会在 future 被 drop 时杀掉子进程。
+    ///
+    /// 只给「必须跑完」的脚本用（目前只有故障让位的 restore 序列）。
+    pub async fn run_detached(
+        &self,
+        script: &str,
+        limit: Duration,
+    ) -> anyhow::Result<CommandResult> {
+        self.runner.run_detached(script, limit).await
+    }
+
     async fn run_script(&self, script: &str) -> anyhow::Result<()> {
         let limit = std::time::Duration::from_secs_f64(self.config.command_timeout_s.max(1.0));
         let result = self.run_raw(script, limit).await?;

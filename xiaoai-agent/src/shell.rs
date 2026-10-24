@@ -41,6 +41,15 @@ pub type ShellFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<CommandRes
 /// 那会把 `TurnState` / `MusicService` / `AgentRuntime` 全部卷进类型参数。
 pub trait ShellRunner: Send + Sync {
     fn run<'a>(&'a self, script: &'a str, limit: Duration) -> ShellFuture<'a>;
+
+    /// 同 `run`，但 future 被 drop 时**不杀**子进程。
+    ///
+    /// 给「必须跑完」的脚本用——目前只有故障让位：launcher 的 restore 序列
+    /// （停 pns → 停 watchdog → 停 mico → 卸保护 → 还原原生文件 → 起原生服务）
+    /// 若被 180s 超时掐在中途，会停在「保护已卸、原生文件还没 mv 回」的中间态，
+    /// 音箱直接哑。正常设备命令（TTS/音乐）必须走 `run`，靠 `kill_on_drop`
+    /// 保证 abort 时旧 TTS 一起死，否则双播。
+    fn run_detached<'a>(&'a self, script: &'a str, limit: Duration) -> ShellFuture<'a>;
 }
 
 /// 生产实现：真的 fork `/bin/sh`。
@@ -51,6 +60,10 @@ impl ShellRunner for SystemShell {
     fn run<'a>(&'a self, script: &'a str, limit: Duration) -> ShellFuture<'a> {
         Box::pin(run_shell(script, limit))
     }
+
+    fn run_detached<'a>(&'a self, script: &'a str, limit: Duration) -> ShellFuture<'a> {
+        Box::pin(run_shell_detached(script, limit))
+    }
 }
 
 /// 测试用的记录型 shell：记下每条脚本，并按预设答案回答。
@@ -60,6 +73,9 @@ impl ShellRunner for SystemShell {
 #[cfg(test)]
 pub struct RecordingShell {
     scripts: std::sync::Mutex<Vec<String>>,
+    /// 走 `run_detached` 的脚本单独记一份：让位必须用 detached 通道，用普通通道
+    /// 会在超时时杀掉正在还原原生的 sh。
+    detached: std::sync::Mutex<Vec<String>>,
     reply: CannedReply,
 }
 
@@ -78,6 +94,7 @@ impl RecordingShell {
     pub fn always_ok() -> Self {
         Self {
             scripts: std::sync::Mutex::new(Vec::new()),
+            detached: std::sync::Mutex::new(Vec::new()),
             reply: CannedReply {
                 stdout: String::new(),
                 stderr: String::new(),
@@ -91,6 +108,7 @@ impl RecordingShell {
     pub fn exiting_with(code: i32, stderr: &str) -> Self {
         Self {
             scripts: std::sync::Mutex::new(Vec::new()),
+            detached: std::sync::Mutex::new(Vec::new()),
             reply: CannedReply {
                 stdout: String::new(),
                 stderr: stderr.to_string(),
@@ -104,6 +122,7 @@ impl RecordingShell {
     pub fn answering(stdout: &str) -> Self {
         Self {
             scripts: std::sync::Mutex::new(Vec::new()),
+            detached: std::sync::Mutex::new(Vec::new()),
             reply: CannedReply {
                 stdout: stdout.to_string(),
                 stderr: String::new(),
@@ -117,6 +136,7 @@ impl RecordingShell {
     pub fn cannot_run(message: &str) -> Self {
         Self {
             scripts: std::sync::Mutex::new(Vec::new()),
+            detached: std::sync::Mutex::new(Vec::new()),
             reply: CannedReply {
                 stdout: String::new(),
                 stderr: String::new(),
@@ -144,6 +164,13 @@ impl RecordingShell {
             .count()
     }
 
+    pub fn detached_scripts(&self) -> Vec<String> {
+        self.detached
+            .lock()
+            .expect("recording shell poisoned")
+            .clone()
+    }
+
     pub fn last_script(&self) -> Option<String> {
         self.scripts
             .lock()
@@ -155,24 +182,36 @@ impl RecordingShell {
 
 #[cfg(test)]
 impl ShellRunner for RecordingShell {
+    fn run_detached<'a>(&'a self, script: &'a str, limit: Duration) -> ShellFuture<'a> {
+        self.detached
+            .lock()
+            .expect("recording shell poisoned")
+            .push(script.to_string());
+        answer(self.reply.clone(), limit)
+    }
+
     fn run<'a>(&'a self, script: &'a str, limit: Duration) -> ShellFuture<'a> {
         self.scripts
             .lock()
             .expect("recording shell poisoned")
             .push(script.to_string());
-        let reply = self.reply.clone();
-        let _ = limit;
-        Box::pin(async move {
-            if let Some(message) = reply.error {
-                return Err(anyhow::anyhow!("{message}"));
-            }
-            Ok(CommandResult {
-                stdout: reply.stdout,
-                stderr: reply.stderr,
-                exit_code: reply.exit_code,
-            })
-        })
+        answer(self.reply.clone(), limit)
     }
+}
+
+#[cfg(test)]
+fn answer(reply: CannedReply, limit: Duration) -> ShellFuture<'static> {
+    let _ = limit;
+    Box::pin(async move {
+        if let Some(message) = reply.error {
+            return Err(anyhow::anyhow!("{message}"));
+        }
+        Ok(CommandResult {
+            stdout: reply.stdout,
+            stderr: reply.stderr,
+            exit_code: reply.exit_code,
+        })
+    })
 }
 
 pub async fn run_shell(script: &str, limit: Duration) -> anyhow::Result<CommandResult> {
@@ -202,6 +241,34 @@ pub async fn run_shell(script: &str, limit: Duration) -> anyhow::Result<CommandR
         stdout,
         stderr,
         exit_code,
+    })
+}
+
+/// 与 `run_shell` 相同，但**不**在 future 被 drop 时杀子进程。
+///
+/// 给故障让位用：超时或任务被 abort 时，正在跑 `restore_native_frontend` 的
+/// `/bin/sh` 必须能跑完，否则会停在「保护已卸、原生 socket 还没 mv 回」的中间态。
+///
+/// 代价要说清：future 被 drop 后子进程会变成 init 的孤儿继续执行，它的 stdout
+/// 管道随之关闭，脚本若大量写 stdout 会收到 EPIPE。还原序列不写 stdout，
+/// 所以这里可以接受；不要拿它跑 TTS/播放这类会输出东西的脚本。
+pub async fn run_shell_detached(script: &str, limit: Duration) -> anyhow::Result<CommandResult> {
+    let fut = Command::new("/bin/sh").arg("-c").arg(script).output();
+
+    let output = match timeout(limit, fut).await {
+        Ok(res) => res?,
+        Err(_) => {
+            let brief: String = script.chars().take(80).collect();
+            return Err(anyhow::anyhow!(
+                "{TIMEOUT_ERROR_PREFIX} after {limit:?}: {brief}"
+            ));
+        }
+    };
+
+    Ok(CommandResult {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        exit_code: output.status.code().unwrap_or(-1),
     })
 }
 
@@ -259,6 +326,44 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "超时后必须立刻返回，实际耗时 {:?}",
             started.elapsed()
+        );
+    }
+
+    /// detached 通道的契约与 `run` 相反：future 被 drop 时子进程**不**被杀，
+    /// 这样让位的 restore 序列能跑完（否则会停在「保护已卸、原生 socket 还没 mv 回」）。
+    #[tokio::test]
+    async fn dropping_the_detached_future_leaves_the_child_running() {
+        let file = pid_file("detached");
+        // sleep 5：万一清理没生效，也不会在 CI 里躺 30 秒。
+        let script = format!("echo $$ > {}; sleep 5", file.display());
+
+        let handle =
+            tokio::spawn(async move { run_shell_detached(&script, Duration::from_secs(30)).await });
+        let mut waited = 0;
+        while !file.exists() && waited < 200 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 1;
+        }
+        assert!(file.exists(), "子进程没有按预期启动");
+        let pid: i32 = std::fs::read_to_string(&file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+
+        handle.abort();
+        let _ = handle.await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let alive = std::path::Path::new(&format!("/proc/{pid}")).exists();
+        // 收尾：杀掉这个孤儿，别污染后续测试环境。
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+        let _ = std::fs::remove_file(&file);
+        assert!(
+            alive,
+            "detached 通道下 abort 不该杀掉子进程 {pid}（否则 restore 会被掐在中途）"
         );
     }
 
