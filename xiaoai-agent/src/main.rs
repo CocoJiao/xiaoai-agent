@@ -437,7 +437,14 @@ fn keep_pending_sections(
             "device" => effective.device = current.device.clone(),
             "asr" => effective.asr = current.asr.clone(),
             "airplay" => effective.airplay = current.airplay.clone(),
-            other => warn!(section = other, "未知的待生效配置段，按旧值保留"),
+            "server" => effective.server = current.server.clone(),
+            // 这条分支以前只 warn、不回填，等于「没保留旧值」：新段的字段会原样
+            // 进句柄，而实际跑着的还是旧配置。server.token 一旦这样漏掉，日志说
+            // 「已热加载」但监听器用的还是旧 token —— 安全相关的显示与实际不符。
+            other => warn!(
+                section = other,
+                "未知的待生效配置段：没有回填逻辑，句柄里会是新值（与实际运行值不一致）"
+            ),
         }
     }
     effective

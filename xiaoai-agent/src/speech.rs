@@ -559,9 +559,10 @@ async fn run_service(
     loop {
         tokio::select! {
             packet = socket.recv_from(&mut buffer) => {
-                // 控制面的 /health 靠这个时间戳区分「管线在转」与「进程还在但不收包」。
-                liveness.last_packet_ms.store(now_ms(), Ordering::Relaxed);
                 let (size, peer) = packet.context("receive speech.usock datagram")?;
+                // 打点放在 `?` 之后：recv 失败不是「收到过包」。放在前面会让持续
+                // 出错的几秒里 last_packet_age 一直显示「刚刚」，把故障藏起来。
+                liveness.last_packet_ms.store(now_ms(), Ordering::Relaxed);
                 let peer = peer.as_pathname()
                     .map(Path::to_path_buf)
                     .context("mipns used an unnamed Unix datagram socket")?;
