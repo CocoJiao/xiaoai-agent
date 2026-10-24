@@ -33,6 +33,16 @@ log() {
     printf '%s\n' "xiaoai-agent launcher: $*"
 }
 
+# 让位（stop）的退出码是 agent 侧的判据（src/main.rs 的 YieldOutcome），改这里
+# 必须同步改那边，否则「前端没受影响」会被误判成「已拆一半」。
+#   0  = 成功，原生前端已恢复
+#   3  = 未受影响：锁被占用等，前端一点没动 —— 唯一允许 agent 继续运行的失败
+#   4  = 已停 pns/watchdog，但 mico 没停掉（前端半哑）
+#   5  = 已拆到一半：保护没卸 / 原生文件没恢复 / 原生服务起不来
+EXIT_UNTOUCHED=3
+EXIT_PARTIAL_STOP=4
+EXIT_HALF_DISMANTLED=5
+
 fail() {
     log "error: $*" >&2
     return 1
@@ -277,31 +287,32 @@ restore_native_files() {
 }
 
 restore_native_frontend() {
+    # 从这里开始每一步都在动前端，所以失败码不是 3：agent 只能退出，不能继续跑。
     if ! stop_pns; then
         fail "failed to stop pns before restoring native services"
-        return 1
+        return "$EXIT_PARTIAL_STOP"
     fi
     stop_watchdog
     if ! stop_mico; then
         fail "failed to stop mico before removing speech protection"
-        return 1
+        return "$EXIT_PARTIAL_STOP"
     fi
     stop_agent_process
     if ! unprotect_speech_socket; then
         fail "failed to remove speech.usock protection"
-        return 1
+        return "$EXIT_HALF_DISMANTLED"
     fi
     if ! restore_native_files; then
         fail "failed to restore native speech files"
-        return 1
+        return "$EXIT_HALF_DISMANTLED"
     fi
     if ! start_native_mico; then
         fail "failed to restart native mico services"
-        return 1
+        return "$EXIT_HALF_DISMANTLED"
     fi
     if ! "$PNS_INIT" start >/dev/null 2>&1; then
         fail "failed to restart native pns"
-        return 1
+        return "$EXIT_HALF_DISMANTLED"
     fi
 }
 
@@ -436,13 +447,22 @@ start_agent() {
 }
 
 stop_agent() {
-    acquire_lock || return 1
+    if ! acquire_lock; then
+        # 前端一点没动：这是唯一一种「让位失败但可以继续运行」的情形。
+        return "$EXIT_UNTOUCHED"
+    fi
     if ! pid_is_running && ! pns_is_overlaid && ! speech_is_protected && [ ! -e "$NATIVE_SPEECH_SOCKET" ]; then
         rm -f "$PID_FILE"
         log "already stopped"
         return 0
     fi
-    restore_native_frontend || return 1
+    # 注意不能写 `if ! restore_native_frontend; then return $?; fi`：`if !` 之后
+    # `$?` 是取反后的 0，会把失败吞掉、让上层以为让位成功。
+    restore_native_frontend
+    restore_status=$?
+    if [ "$restore_status" -ne 0 ]; then
+        return "$restore_status"
+    fi
     log "stopped and restored the native speech frontend"
 }
 
