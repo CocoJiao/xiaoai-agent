@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -21,6 +23,146 @@ pub struct CommandResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+}
+
+/// shell 执行体返回的未来。手写 box 而不是引 `async-trait`：
+/// trait 方法需要对象安全（`Device` 要存 `Arc<dyn ShellRunner>`），
+/// 而 `async fn` 在 trait 里还不是 dyn-compatible。
+pub type ShellFuture<'a> = Pin<Box<dyn Future<Output = Result<CommandResult, AppError>> + Send + 'a>>;
+
+/// 设备命令的唯一执行出口。
+///
+/// `Device` 的 11 个方法最后都落到一条 shell 脚本上（`device.rs` 的
+/// `run_script`），所以外部可观测效果——TTS、LED、ubus 追问、让位——只需要在
+/// **这一层**拦一次就能测。不要为 `Device` 的方法逐个抽 trait：
+/// 那会把 `TurnState` / `MusicService` / `AgentRuntime` 全部卷进类型参数。
+pub trait ShellRunner: Send + Sync {
+    fn run<'a>(&'a self, script: &'a str, limit: Duration) -> ShellFuture<'a>;
+}
+
+/// 生产实现：真的 fork `/bin/sh`。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemShell;
+
+impl ShellRunner for SystemShell {
+    fn run<'a>(&'a self, script: &'a str, limit: Duration) -> ShellFuture<'a> {
+        Box::pin(run_shell(script, limit))
+    }
+}
+
+/// 测试用的记录型 shell：记下每条脚本，并按预设答案回答。
+///
+/// 手写而非 mockall：这里只需要「收到什么、答什么」，不值得为它引入
+/// 过程宏依赖，也不值得让被测代码为了 mock 改签名。
+#[cfg(test)]
+pub struct RecordingShell {
+    scripts: std::sync::Mutex<Vec<String>>,
+    reply: CannedReply,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct CannedReply {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    /// `Some` 表示这一层直接失败（模拟超时、无法 fork），不产生 `CommandResult`。
+    error: Option<String>,
+}
+
+#[cfg(test)]
+impl RecordingShell {
+    pub fn always_ok() -> Self {
+        Self {
+            scripts: std::sync::Mutex::new(Vec::new()),
+            reply: CannedReply {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+                error: None,
+            },
+        }
+    }
+
+    /// 所有命令都返回非 0 退出码（设备脚本用返回码表达失败）。
+    pub fn exiting_with(code: i32, stderr: &str) -> Self {
+        Self {
+            scripts: std::sync::Mutex::new(Vec::new()),
+            reply: CannedReply {
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+                exit_code: code,
+                error: None,
+            },
+        }
+    }
+
+    /// 所有命令都成功，但 stdout 固定为 `stdout`（`pnshelper` 的 ubus 应答走这里）。
+    pub fn answering(stdout: &str) -> Self {
+        Self {
+            scripts: std::sync::Mutex::new(Vec::new()),
+            reply: CannedReply {
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+                error: None,
+            },
+        }
+    }
+
+    /// 执行体本身失败（超时 / 无法执行），不产生 `CommandResult`。
+    pub fn cannot_run(message: &str) -> Self {
+        Self {
+            scripts: std::sync::Mutex::new(Vec::new()),
+            reply: CannedReply {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: -1,
+                error: Some(message.to_string()),
+            },
+        }
+    }
+
+    pub fn scripts(&self) -> Vec<String> {
+        self.scripts.lock().expect("recording shell poisoned").clone()
+    }
+
+    pub fn command_count(&self) -> usize {
+        self.scripts.lock().expect("recording shell poisoned").len()
+    }
+
+    pub fn count_matching(&self, needle: &str) -> usize {
+        self.scripts()
+            .iter()
+            .filter(|script| script.contains(needle))
+            .count()
+    }
+
+    pub fn last_script(&self) -> Option<String> {
+        self.scripts.lock().expect("recording shell poisoned").last().cloned()
+    }
+}
+
+#[cfg(test)]
+impl ShellRunner for RecordingShell {
+    fn run<'a>(&'a self, script: &'a str, limit: Duration) -> ShellFuture<'a> {
+        self.scripts
+            .lock()
+            .expect("recording shell poisoned")
+            .push(script.to_string());
+        let reply = self.reply.clone();
+        let _ = limit;
+        Box::pin(async move {
+            if let Some(message) = reply.error {
+                return Err(message.into());
+            }
+            Ok(CommandResult {
+                stdout: reply.stdout,
+                stderr: reply.stderr,
+                exit_code: reply.exit_code,
+            })
+        })
+    }
 }
 
 pub async fn run_shell(script: &str, limit: Duration) -> Result<CommandResult, AppError> {
