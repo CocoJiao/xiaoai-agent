@@ -1,7 +1,9 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context};
 use bytes::Bytes;
@@ -198,6 +200,41 @@ impl SpeechTurn {
     }
 }
 
+/// 控制面（issue #9）需要的活体信息：收包时刻与重启次数。
+///
+/// 用 `Arc<Atomic*>` 而不是给 `SpeechService` 加读锁：控制面在另一个 task 里，
+/// 每来一个 HTTP 请求读一次，绝不该因为读健康度而阻塞语音主循环。
+#[derive(Clone, Default)]
+pub struct SpeechLiveness {
+    pub last_packet_ms: Arc<AtomicU64>,
+    pub restarts: Arc<AtomicU32>,
+}
+
+impl SpeechLiveness {
+    /// 距上一次收到 mipns 数据报多久；还没收到过就是 `None`。
+    pub fn last_packet_age(&self) -> Option<Duration> {
+        let last = self.last_packet_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return None;
+        }
+        let now = now_ms();
+        (now >= last).then(|| Duration::from_millis(now - last))
+    }
+
+    /// 收包循环累计原地重启次数（`supervise_service` 每次重启 +1）。
+    pub fn restarts(&self) -> u32 {
+        self.restarts.load(Ordering::Relaxed)
+    }
+}
+
+/// 当前毫秒时间戳。放这里而不是控制面里：收包侧要用，而 speech 不该依赖 server。
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub struct SpeechService {
     handle: SpeechHandle,
     event_rx: mpsc::Receiver<SpeechServiceEvent>,
@@ -206,6 +243,7 @@ pub struct SpeechService {
     /// 绑定时路径上的 inode，用于「让位之后这条路径还是不是我的」判断。
     /// `None` = bind 成功但 stat 失败（极罕见）：此时不能断言归属，见 `SocketOwnership`。
     bound_inode: Option<u64>,
+    liveness: SpeechLiveness,
 }
 
 /// 「这个 speech socket 现在还是不是我绑的那一个」——一个事实判断，不是猜测。
@@ -213,6 +251,7 @@ pub struct SpeechService {
 /// 让位（`start-agent.sh stop`）会把原生 socket `mv` 回同一路径，inode 随之改变。
 /// 如果只看 launcher 的退出码，就会出现「其实已经让位成功、却当成失败」：脚本
 /// 可能因为「杀不掉 agent」在收尾阶段返回非 0，而原生前端早已恢复。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketOwnership {
     path: PathBuf,
     inode: Option<u64>,
@@ -240,6 +279,16 @@ impl SocketOwnership {
     /// = 哑且无任何信号），那比退出码 1 更糟。
     pub fn taken_over(&self) -> bool {
         matches!((self.inode, read_inode(&self.path)), (Some(mine), Some(now)) if now != mine)
+    }
+
+    /// 测试用：`inode: None` = 当初 stat 失败，此时 `still_owned()` 与
+    /// `taken_over()` 都是 false（不能断言归属）。
+    #[cfg(test)]
+    pub fn unattributed(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            inode: None,
+        }
     }
 
     /// 测试用：直接按给定 inode 构造，不依赖真实 bind。
@@ -282,7 +331,15 @@ impl SpeechService {
         let (command_tx, command_rx) = mpsc::channel(16);
         let handle = SpeechHandle { command_tx };
         let task_handle = handle.clone();
-        let task = tokio::spawn(supervise_service(socket, event_tx, command_rx, task_handle));
+        let liveness = SpeechLiveness::default();
+        let task_liveness = liveness.clone();
+        let task = tokio::spawn(supervise_service(
+            socket,
+            event_tx,
+            command_rx,
+            task_handle,
+            task_liveness,
+        ));
 
         info!(socket = %socket_path.display(), "speech.usock service listening");
         Ok(Self {
@@ -291,6 +348,7 @@ impl SpeechService {
             task,
             socket_path,
             bound_inode,
+            liveness,
         })
     }
 
@@ -299,6 +357,11 @@ impl SpeechService {
     }
 
     /// 让位判断用的「我绑的是哪个 socket」快照。
+    /// 控制面用：收包时刻 / 重启次数（无锁，读的是原子量）。
+    pub fn liveness(&self) -> SpeechLiveness {
+        self.liveness.clone()
+    }
+
     pub fn ownership(&self) -> SocketOwnership {
         SocketOwnership {
             path: self.socket_path.clone(),
@@ -432,12 +495,22 @@ async fn supervise_service(
     event_tx: mpsc::Sender<SpeechServiceEvent>,
     mut command_rx: mpsc::Receiver<ServiceCommand>,
     handle: SpeechHandle,
+    liveness: SpeechLiveness,
 ) {
     let mut state = ServiceState::default();
     let mut restarts = 0_u32;
     let fatal = loop {
         let started = Instant::now();
-        match run_service(&socket, &event_tx, &mut command_rx, &mut state, &handle).await {
+        match run_service(
+            &socket,
+            &event_tx,
+            &mut command_rx,
+            &mut state,
+            &handle,
+            &liveness,
+        )
+        .await
+        {
             // 命令通道关闭 = 主程序已经走了，正常退出。
             Ok(()) => break None,
             Err(err) => {
@@ -450,6 +523,7 @@ async fn supervise_service(
                     restarts = 0;
                 }
                 restarts += 1;
+                liveness.restarts.fetch_add(1, Ordering::Relaxed);
                 if restarts > MAX_SERVICE_RESTARTS {
                     break Some(err);
                 }
@@ -478,12 +552,15 @@ async fn run_service(
     command_rx: &mut mpsc::Receiver<ServiceCommand>,
     state: &mut ServiceState,
     handle: &SpeechHandle,
+    liveness: &SpeechLiveness,
 ) -> anyhow::Result<()> {
     let mut buffer = vec![0_u8; MAX_DATAGRAM_SIZE];
 
     loop {
         tokio::select! {
             packet = socket.recv_from(&mut buffer) => {
+                // 控制面的 /health 靠这个时间戳区分「管线在转」与「进程还在但不收包」。
+                liveness.last_packet_ms.store(now_ms(), Ordering::Relaxed);
                 let (size, peer) = packet.context("receive speech.usock datagram")?;
                 let peer = peer.as_pathname()
                     .map(Path::to_path_buf)

@@ -7,6 +7,7 @@ mod device;
 mod mcp;
 mod mcp_legacy_sse;
 mod music;
+mod server;
 mod shell;
 mod speech;
 mod tools;
@@ -74,6 +75,18 @@ async fn main() -> anyhow::Result<()> {
     // 让位判断用：我绑的是哪个 socket。让位脚本会把原生 socket mv 回同一路径，
     // inode 随之改变——用它判断「到底有没有交出去」，比看退出码可靠。
     let ownership = speech.ownership();
+
+    // 本地控制面（issue #9）：默认关闭，关闭时不 bind 任何端口。
+    // 放在 speech bind 之后：/health 的判据是「speech socket 还是不是我们的」，
+    // 手里必须先有 ownership 才有意义。
+    let control_state = Arc::new(server::ControlState {
+        token: initial.server.token.clone(),
+        socket: ownership.clone(),
+        liveness: speech.liveness(),
+        started_at: std::time::Instant::now(),
+        config_path: Some(cli.config.clone()),
+    });
+    let _control_task = server::spawn(&initial.server, control_state).await?;
 
     let device = Device::new(initial.device.clone());
     let asr = AsrClient::new(initial.asr.clone())?;
