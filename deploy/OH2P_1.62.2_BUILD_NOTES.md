@@ -70,11 +70,17 @@ ssh -4 -o IPQoS=none \
 
 ## 恢复与安全
 
-刷机前后都建议保留原始 rootfs 和补丁 rootfs：
+补丁流程现在**只把最终产物留在 `assets/`**：
 
 ```text
-root.squashfs
-root-patched.squashfs
+assets/<固件名>/root-patched.squashfs
 ```
 
-`root.squashfs` 可作为参考或恢复输入。补丁后应避免原生 OTA；如果设备意外升级，SSH 和 `/data/init.sh` 自启动钩子可能消失，需要针对新固件重新制作补丁。
+原厂 `root.squashfs` 不再随产物一起复制（它占 36MB，且容易和新版本固件混淆）。它只存在于
+`temp/<固件名>/` 里，而 `extract.sh` 每次构建都会 `rm -rf temp/` —— 也就是说**本地产物
+不能当作恢复输入**。
+
+需要原厂镜像做对照或恢复时，用 [`docs/account-free-firmware-download.md`](../../docs/account-free-firmware-download.md)
+的免账号方式重新下载官方固件（可核对 `hash`），比长期存一份 36MB 的旧镜像更干净。
+
+补丁后应避免原生 OTA；如果设备意外升级，SSH 和 `/data/init.sh` 自启动钩子可能消失，需要针对新固件重新制作补丁。

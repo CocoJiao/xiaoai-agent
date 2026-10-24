@@ -23,8 +23,9 @@ apply_patches() {
                     local temp_patch=$(mktemp)
                     # 将补丁文件中的 {SSH_PASSWORD} 替换为 PASSWORD
                     sed "s|{SSH_PASSWORD}|$PASSWORD|g" "$file" > "$temp_patch"
-                    # 应用替换后的补丁
-                    patch -p1 < "$temp_patch"
+                    # 应用替换后的补丁。--no-backup-if-mismatch：不要留 .orig，
+                    # 否则备份文件会被打进镜像（patch.sh 与 squashfs.sh 之间没有清理步骤）。
+                    patch -p1 --no-backup-if-mismatch < "$temp_patch"
                     # 清理临时文件
                     rm "$temp_patch"
                 elif [[ "$file" == *.sh ]]; then
