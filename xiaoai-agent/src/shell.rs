@@ -28,7 +28,8 @@ pub struct CommandResult {
 /// shell 执行体返回的未来。手写 box 而不是引 `async-trait`：
 /// trait 方法需要对象安全（`Device` 要存 `Arc<dyn ShellRunner>`），
 /// 而 `async fn` 在 trait 里还不是 dyn-compatible。
-pub type ShellFuture<'a> = Pin<Box<dyn Future<Output = Result<CommandResult, AppError>> + Send + 'a>>;
+pub type ShellFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<CommandResult, AppError>> + Send + 'a>>;
 
 /// 设备命令的唯一执行出口。
 ///
@@ -124,7 +125,10 @@ impl RecordingShell {
     }
 
     pub fn scripts(&self) -> Vec<String> {
-        self.scripts.lock().expect("recording shell poisoned").clone()
+        self.scripts
+            .lock()
+            .expect("recording shell poisoned")
+            .clone()
     }
 
     pub fn command_count(&self) -> usize {
@@ -139,7 +143,11 @@ impl RecordingShell {
     }
 
     pub fn last_script(&self) -> Option<String> {
-        self.scripts.lock().expect("recording shell poisoned").last().cloned()
+        self.scripts
+            .lock()
+            .expect("recording shell poisoned")
+            .last()
+            .cloned()
     }
 }
 

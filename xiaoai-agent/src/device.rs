@@ -170,7 +170,11 @@ mod tests {
         // 设备脚本用返回码表达失败，上层（run_session 的错误分支）靠这个 Err
         // 决定要不要提示用户，吞掉就等于静默失败。
         let shell = Arc::new(RecordingShell::exiting_with(3, "no such device"));
-        let err = device_with(shell).speak("hi").await.unwrap_err().to_string();
+        let err = device_with(shell)
+            .speak("hi")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("exit=3"), "{err}");
         assert!(err.contains("no such device"), "{err}");
     }
