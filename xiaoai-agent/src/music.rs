@@ -756,3 +756,107 @@ fn subsonic_token(password: &str) -> (String, String) {
     let token = format!("{:x}", md5::compute(format!("{password}{salt}")));
     (salt, token)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_many_handles_all_supported_separators() {
+        assert_eq!(
+            split_many("周杰伦 晴天\n稻香;七里香；夜曲"),
+            vec!["周杰伦 晴天", "稻香", "七里香", "夜曲"]
+        );
+        // 全是分隔符和空白时不能产出空条目（否则会拿空串去搜索）
+        assert!(split_many("\n  \n;\n；").is_empty());
+        assert_eq!(split_many("  只有一条  "), vec!["只有一条"]);
+        assert!(split_many("").is_empty());
+    }
+
+    #[test]
+    fn value_string_coerces_json_scalars() {
+        // id 既可能是字符串也可能是数字（Navidrome 用 "al-123"，网易云用 186016）
+        assert_eq!(value_string(&json!("al-123")), "al-123");
+        assert_eq!(value_string(&json!(186016)), "186016");
+        assert_eq!(value_string(&json!(1.5)), "1.5");
+        // 没有值的时候退化成 JSON 字面量，而不是空串：调用方据此能判断「缺 id」
+        assert_eq!(value_string(&json!(null)), "null");
+    }
+
+    #[test]
+    fn parse_navidrome_song_falls_back_to_single_artist() {
+        // Subsonic 的 id3 结构：artists 是数组
+        let modern = json!({
+            "id": "al-306",
+            "title": "晴天",
+            "artists": [{"name": "周杰伦"}, {"name": "方文山"}],
+            "album": "叶惠美",
+            "duration": 269
+        });
+        let song = parse_navidrome_song(&modern);
+        assert_eq!(song.id, "al-306");
+        assert_eq!(song.name, "晴天", "title 优先于 name");
+        assert_eq!(song.artists, vec!["周杰伦", "方文山"]);
+        assert_eq!(song.album, "叶惠美");
+        // 注意：Navidrome 的 duration 是秒，这里换算成毫秒
+        assert_eq!(song.duration_ms, Some(269_000));
+        assert!(song.fee.is_none(), "Navidrome 没有付费标记");
+
+        // 老实现只给单个 artist 字符串时要能用它兜底
+        let legacy = json!({"id": 42, "name": "稻香", "artist": "周杰伦"});
+        let song = parse_navidrome_song(&legacy);
+        assert_eq!(song.id, "42");
+        assert_eq!(song.name, "稻香", "没有 title 时回退到 name");
+        assert_eq!(song.artists, vec!["周杰伦"]);
+        assert!(song.duration_ms.is_none());
+    }
+
+    #[test]
+    fn subsonic_token_matches_subsonic_auth_scheme() {
+        let (salt, token) = subsonic_token("secret");
+        // Subsonic 的 salt 是 8 字节十六进制，token = md5(password + salt)
+        assert_eq!(salt.len(), 16);
+        assert!(salt.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(
+            token,
+            format!("{:x}", md5::compute(format!("secret{salt}")))
+        );
+
+        let (second_salt, _) = subsonic_token("secret");
+        assert_ne!(salt, second_salt, "salt 必须每次随机，否则可被重放");
+    }
+
+    #[test]
+    fn parse_netease_song_supports_both_response_shapes() {
+        // 新版接口用 ar / al / dt
+        let modern = json!({
+            "id": 186016,
+            "name": "晴天",
+            "ar": [{"name": "周杰伦"}],
+            "al": {"name": "叶惠美"},
+            "dt": 269000,
+            "fee": 0
+        });
+        let song = parse_netease_song(&modern);
+        assert_eq!(song.id, "186016");
+        assert_eq!(song.name, "晴天");
+        assert_eq!(song.artists, vec!["周杰伦"]);
+        assert_eq!(song.album, "叶惠美");
+        assert_eq!(song.duration_ms, Some(269000));
+
+        // 老版/搜索接口用 artists / album / duration
+        let legacy = json!({
+            "id": "abc123",
+            "name": "稻香",
+            "artists": [{"name": "周杰伦"}, {"name": "方文山"}],
+            "album": {"name": "魔杰座"},
+            "duration": 223000
+        });
+        let song = parse_netease_song(&legacy);
+        assert_eq!(song.id, "abc123");
+        assert_eq!(song.artists, vec!["周杰伦", "方文山"]);
+        assert_eq!(song.album, "魔杰座");
+        assert_eq!(song.duration_ms, Some(223000));
+        assert!(song.fee.is_none());
+    }
+}
