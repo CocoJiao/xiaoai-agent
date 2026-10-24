@@ -201,7 +201,8 @@ pub struct SpeechService {
     task: JoinHandle<()>,
     socket_path: PathBuf,
     /// 绑定时路径上的 inode，用于「让位之后这条路径还是不是我的」判断。
-    bound_inode: u64,
+    /// `None` = bind 成功但 stat 失败（极罕见）：此时不能断言归属，见 `SocketOwnership`。
+    bound_inode: Option<u64>,
 }
 
 /// 「这个 speech socket 现在还是不是我绑的那一个」——一个事实判断，不是猜测。
@@ -211,7 +212,7 @@ pub struct SpeechService {
 /// 可能因为「杀不掉 agent」在收尾阶段返回非 0，而原生前端早已恢复。
 pub struct SocketOwnership {
     path: PathBuf,
-    inode: u64,
+    inode: Option<u64>,
 }
 
 impl SocketOwnership {
@@ -220,13 +221,22 @@ impl SocketOwnership {
     }
 
     /// 路径上还是本进程绑的那个 socket 吗。
+    ///
+    /// 知道自己绑的 inode、且路径上现在也是同一个 → 是。其余情况（包括路径暂时
+    /// 不存在、或当初 stat 失败）一律返回 `false`：不能断言「还是我的」。
     pub fn still_owned(&self) -> bool {
-        read_inode(&self.path) == Some(self.inode)
+        matches!((self.inode, read_inode(&self.path)), (Some(mine), Some(now)) if now == mine)
     }
 
-    /// 已被接管走：路径上的 socket 换了 inode，或者干脆不存在了（原生正在 mv 回来）。
+    /// 已被接管走：路径上**确实存在**、但 inode 已经不是我们绑的那个。
+    ///
+    /// 这条定义刻意窄一档：「路径不存在」不算被接管。让位的还原序列是
+    /// `rm -f "$SPEECH_SOCKET"` 再 `mv native speech.usock`，两条命令之间路径会
+    /// 短暂消失；这个窗口里我们既不知道脚本进行到哪一步，也不知道 `mv` 会不会
+    /// 失败。把它算成「已接管」会在超时路径上误报成功（退出码 0 + watchdog 已停
+    /// = 哑且无任何信号），那比退出码 1 更糟。
     pub fn taken_over(&self) -> bool {
-        !self.still_owned()
+        matches!((self.inode, read_inode(&self.path)), (Some(mine), Some(now)) if now != mine)
     }
 
     /// 测试用：直接按给定 inode 构造，不依赖真实 bind。
@@ -234,7 +244,16 @@ impl SocketOwnership {
     pub fn for_test(path: impl Into<PathBuf>, inode: u64) -> Self {
         Self {
             path: path.into(),
-            inode,
+            inode: Some(inode),
+        }
+    }
+
+    /// 测试用：模拟「不知道当初绑的是哪个 inode」。
+    #[cfg(test)]
+    pub fn unknown_for_test(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            inode: None,
         }
     }
 }
@@ -252,12 +271,9 @@ impl SpeechService {
         prepare_socket_path(&socket_path)?;
         let socket = UnixDatagram::bind(&socket_path)
             .with_context(|| format!("bind speech socket {}", socket_path.display()))?;
-        let bound_inode = read_inode(&socket_path).with_context(|| {
-            format!(
-                "read inode of the freshly bound speech socket {}",
-                socket_path.display()
-            )
-        })?;
+        // 刚 bind 完立刻 stat 几乎不会失败；真失败也不该把「服务可启动」变成
+        // 「bind + stat 都成功」——记成 None，让位判定保守地不下结论就好。
+        let bound_inode = read_inode(&socket_path);
 
         let (event_tx, event_rx) = mpsc::channel(16);
         let (command_tx, command_rx) = mpsc::channel(16);
@@ -970,6 +986,62 @@ mod tests {
         assert_eq!(find_varint(&outer, 1), Some(SPEECH_TYPE_DOWNWARD));
         let downward = parse_fields(find_bytes(&outer, 3).unwrap()).unwrap();
         (find_varint(&downward, 1).unwrap(), downward)
+    }
+
+    /// 唯一正确的「已接管」证据：还原序列的 `mv` 让路径指向另一个 inode。
+    ///
+    /// 注意 ext4 上「rm 之后立刻 create」常会复用刚释放的 inode，所以这里复刻
+    /// 脚本真实的 `rm -f` + `mv`（两个文件同时存在过，inode 必然不同）。
+    #[test]
+    fn socket_ownership_notices_the_inode_change_from_the_restore_sequence() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("xiaoai-ino-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("speech.usock");
+        let native = dir.join("speech.native.usock");
+        fs::write(&live, b"agent").unwrap();
+        fs::write(&native, b"native").unwrap();
+
+        let ownership = SocketOwnership::for_test(&live, fs::metadata(&live).unwrap().ino());
+        assert!(ownership.still_owned(), "刚记下的 inode 应当还是自己的");
+        assert!(!ownership.taken_over());
+
+        // 复刻 start-agent.sh 的 restore_native_files
+        fs::remove_file(&live).unwrap();
+        fs::rename(&native, &live).unwrap();
+
+        assert!(
+            ownership.taken_over(),
+            "mv 换掉了 inode，这正是让位成功的唯一事实证据"
+        );
+        assert!(!ownership.still_owned());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 「路径不存在」既不是「还是我的」，也**不是**「已被接管」——它是
+    /// rm→mv 之间的窗口、mv 失败、脚本没跑到 restore 三种可能的混合。
+    #[test]
+    fn socket_ownership_refuses_to_call_a_missing_path_taken_over() {
+        let ownership = SocketOwnership::for_test("/nonexistent/xiaoai-agent/speech.usock", 42);
+        assert!(!ownership.still_owned());
+        assert!(
+            !ownership.taken_over(),
+            "不能把「路径暂时不存在」当成接管成功，否则超时路径会误报成功"
+        );
+    }
+
+    /// 当初 stat 失败（inode 未知）：两个方向都不下结论。
+    #[test]
+    fn socket_ownership_stays_neutral_when_the_bound_inode_is_unknown() {
+        let dir = std::env::temp_dir().join(format!("xiaoai-unknown-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("speech.usock");
+        fs::write(&live, b"agent").unwrap();
+
+        let ownership = SocketOwnership::unknown_for_test(&live);
+        assert!(!ownership.still_owned());
+        assert!(!ownership.taken_over());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

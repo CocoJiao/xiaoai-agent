@@ -680,13 +680,25 @@ async fn yield_to_native(
         }
     };
 
-    // 退出码说失败、但 socket 已经不是我们绑的那个 inode：原生其实已经接管了。
     let taken_over = ownership.taken_over();
+    // 两种矛盾态都要留痕：它们正是「命令说的」和「事实」对不上的地方，
+    // 而 `succeeded()` 会把它们合成一个结论——不记录就再也看不见了。
     if taken_over && !issued {
         warn!(
             socket = %ownership.path().display(),
             "让位命令报失败，但 speech.usock 已被原生接管，按成功处理"
         );
+    }
+    if issued && !taken_over {
+        // 典型来源：restore_native_files 里 [ -e "$NATIVE_SPEECH_SOCKET" ] 为假时，
+        // 脚本既不 rm 也不 mv，一路返回 0——麦克风其实没交出去。
+        // 另外也可能是「不知道当初绑的是哪个 inode」，那种情况下结论同样存疑。
+        let detail = if ownership.still_owned() {
+            "让位命令报告成功，但 speech.usock 还是本进程绑的 inode：麦克风可能没交出去"
+        } else {
+            "让位命令报告成功，但无法确认 speech.usock 归属：让位结果存疑"
+        };
+        warn!(socket = %ownership.path().display(), "{detail}");
     }
     YieldOutcome { issued, taken_over }
 }
@@ -1347,16 +1359,19 @@ mod tests {
         let device = Device::with_runner(DeviceConfig::default(), shell);
         let launcher = Path::new("/data/open-xiaoai/start-agent.sh");
 
-        let outcome = yield_to_native(&device, Some(launcher), &taken_over_socket(), "fatal").await;
+        let owned = taken_over_socket("yield-taken-over");
+        let outcome = yield_to_native(&device, Some(launcher), &owned, "fatal").await;
 
         assert!(!outcome.issued, "命令本身确实失败了");
         assert!(outcome.taken_over, "但 socket 已经被接管走");
         assert!(outcome.succeeded(), "这种情况必须算让位成功");
+        let _ = std::fs::remove_file(owned.path());
     }
 
-    /// 反向：脚本成功、但 socket 还在我们手里，这时「命令成功」就是成功。
+    /// 命令干净退出、但 socket 还在我们手里：仍算成功（命令确实执行了），
+    /// 矛盾态由 `yield_to_native` 里的 warn 留痕，不由 `succeeded()` 表达。
     #[tokio::test]
-    async fn yield_stays_a_failure_when_the_socket_is_still_ours() {
+    async fn yield_succeeds_when_the_command_succeeded_even_when_still_owned() {
         let shell = Arc::new(RecordingShell::always_ok());
         let device = Device::with_runner(DeviceConfig::default(), shell);
         let launcher = Path::new("/data/open-xiaoai/start-agent.sh");
@@ -1367,6 +1382,7 @@ mod tests {
         assert!(outcome.issued);
         assert!(!outcome.taken_over);
         assert!(outcome.succeeded(), "命令成功就算让位达成");
+        let _ = std::fs::remove_file(owned.path());
     }
 
     /// 一次热加载的全量用例配置：同时含「热加载段」和「需重启段」。
@@ -1412,9 +1428,20 @@ agent:
         SocketOwnership::for_test(path, inode)
     }
 
-    /// 「已经被接管走」：路径不存在（原生正在 mv 回来的窗口也算这一类）。
-    fn taken_over_socket() -> SocketOwnership {
-        SocketOwnership::for_test("/nonexistent/xiaoai-agent/speech.usock", 1)
+    /// 「已经被接管走」：复刻 launcher 的 `rm -f` + `mv`，让路径指向另一个 inode。
+    ///
+    /// 不能用「路径不存在」来代表已接管——那正是 rm→mv 之间窗口的样子，
+    /// 也可能是 mv 失败或脚本没跑到 restore。
+    fn taken_over_socket(tag: &str) -> SocketOwnership {
+        use std::os::unix::fs::MetadataExt;
+        let live = temp_config_path(tag).with_extension("usock");
+        let native = live.with_extension("native.usock");
+        std::fs::write(&live, b"agent").expect("写 agent socket 占位");
+        std::fs::write(&native, b"native").expect("写原生 socket 占位");
+        let mine = std::fs::metadata(&live).expect("读 inode").ino();
+        std::fs::remove_file(&live).expect("rm");
+        std::fs::rename(&native, &live).expect("mv");
+        SocketOwnership::for_test(live, mine)
     }
 
     /// 重载期间的 SIGHUP 必须「合并成下一轮」，不能静默丢弃：否则用户改错再改回来、
