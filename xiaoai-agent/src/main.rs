@@ -14,7 +14,7 @@ mod vad;
 mod weather;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -73,6 +73,8 @@ async fn main() -> anyhow::Result<()> {
     let failures = Arc::new(AtomicU32::new(0));
     let (reload_tx, mut reload_rx) = mpsc::channel::<()>(1);
     spawn_sighup_listener(reload_tx);
+    // 同时只允许一次重载在跑：相邻两次 SIGHUP 不该叠成两次工具重建 + 两次 MCP 重连。
+    let reloading = Arc::new(AtomicBool::new(false));
     let launcher = launcher_path();
     if launcher.is_none() {
         warn!("找不到 start-agent.sh：故障时无法主动让位，只能退出等 watchdog 重启");
@@ -217,7 +219,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             Some(()) = reload_rx.recv() => {
-                apply_config_reload(&config, &cli.config, &agent).await;
+                // 重载不进主循环：MCP 重连单 server 最坏 20 秒（mcp.rs 的
+                // 2×timeout_s 上限），这段时间必须继续 poll 语音事件——
+                // 语音是这台设备唯一的命脉，配置重载是可以等的东西。
+                spawn_config_reload(&config, cli.config.clone(), &agent, &reloading);
             }
             _ = session_check.tick() => {
                 let session_finished = active_session
@@ -341,6 +346,10 @@ struct TurnState {
     /// 热加载句柄：每轮取一次快照，所以改完 yaml 下一轮就生效。
     config: ConfigHandle,
     /// LED id 来自启动期快照（device 段按「改完要重启」处理，不能一半新一半旧）。
+    ///
+    /// 注意这是**第二份真值**：它与 `config.get().device` 恒等，靠
+    /// `keep_pending_sections` 把 device 段回填成旧值来维持。改造 device 段的
+    /// 热加载时，这两处必须一起改，否则会出现「LED 用新 id、TTS 用旧模板」。
     led: DeviceConfig,
     device: Device,
     asr: AsrClient,
@@ -430,6 +439,31 @@ fn spawn_sighup_listener(tx: mpsc::Sender<()>) {
     });
 }
 
+/// 把一次重载丢到后台跑，同一时刻只允许一个。
+///
+/// 为什么不在主循环里 `await`：`agent.reload()` 里含 MCP 重连，单 server 上限
+/// 2×`timeout_s`（默认 20 秒），多 server 累加。那段时间主循环不被 poll，
+/// `speech.recv()` 收不到唤醒、`session_check` 推迟失败检测、`Fatal` 触发的
+/// 让位也会被推迟——等于让一条配置重载堵住故障恢复路径。
+fn spawn_config_reload(
+    config: &ConfigHandle,
+    path: PathBuf,
+    agent: &Arc<AgentRuntime>,
+    reloading: &Arc<AtomicBool>,
+) {
+    if reloading.swap(true, Ordering::AcqRel) {
+        warn!("上一次配置重载尚未结束，忽略这次 SIGHUP");
+        return;
+    }
+    let config = config.clone();
+    let agent = agent.clone();
+    let flag = reloading.clone();
+    tokio::spawn(async move {
+        apply_config_reload(&config, &path, &agent).await;
+        flag.store(false, Ordering::Release);
+    });
+}
+
 /// 执行一次配置重载：读文件 → 分类 → 换句柄 → 重建工具与 MCP。
 ///
 /// 任何一步失败都保留旧配置：一份写坏的 yaml 不能让音箱因为一次 SIGHUP 变哑。
@@ -468,6 +502,13 @@ async fn apply_config_reload(handle: &ConfigHandle, path: &Path, agent: &AgentRu
     // 关键不变量：句柄里的配置必须等于「运行中真正生效的配置」。
     // 所以待重启段与拒绝段要回填旧值，否则读句柄的人会以为 device/asr 已经换了。
     let effective = keep_pending_sections(&current, &next, &changes);
+    if !changes.should_apply() {
+        // 只有「需重启 / 被拒绝」的段变了：告警已经打过，句柄和工具服务器
+        // 都保持不动。否则会掉进「每发一次 SIGHUP 就白重建一次」的坑。
+        info!("本次没有可热加载的段，句柄与工具服务器保持不变");
+        return;
+    }
+
     let previous = handle.replace(Arc::new(effective)).await;
     // 工具结构体各自持有配置快照（见 agent.rs 的 build_tool_server），
     // 所以换配置之后必须让 agent 重建工具服务器与 MCP 连接。
@@ -1253,6 +1294,41 @@ agent:
 
         let after = state.config.get().await;
         assert_eq!(after.llm.model, before.llm.model);
+        assert_eq!(
+            after.runtime.session_idle_timeout_s,
+            before.runtime.session_idle_timeout_s
+        );
+    }
+
+    /// 只改了 device（需重启）段：不该触发任何重载动作，句柄原样不动。
+    /// 这是 P3 那条「每发一次 SIGHUP 就白重建一次工具/MCP」的回归测试。
+    #[tokio::test]
+    async fn config_reload_is_a_noop_when_only_restart_sections_changed() {
+        let state = test_state(Arc::new(RecordingShell::always_ok())).await;
+        let before = state.config.get().await;
+        let path = temp_config_path("device-only");
+        std::fs::write(
+            &path,
+            // 热加载段保持与测试基线一致，只让 device 段不同——否则
+            // session_idle_timeout_s / agent.tools_enabled 会各自成为热加载变化。
+            "runtime:
+  session_idle_timeout_s: 1
+agent:
+  tools_enabled: false
+device:
+  tts_command: \"/usr/sbin/tts_play.sh --changed {text}\"
+",
+        )
+        .unwrap();
+
+        apply_config_reload(&state.config, &path, &state.agent).await;
+        let _ = std::fs::remove_file(&path);
+
+        let after = state.config.get().await;
+        assert_eq!(
+            after.device.tts_command, before.device.tts_command,
+            "device 段需要重启，句柄必须原样不动"
+        );
         assert_eq!(
             after.runtime.session_idle_timeout_s,
             before.runtime.session_idle_timeout_s

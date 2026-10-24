@@ -665,6 +665,17 @@ impl ConfigChanges {
     pub fn is_noop(&self) -> bool {
         self.applied.is_empty() && self.needs_restart.is_empty() && self.rejected.is_empty()
     }
+
+    /// 是否真的值得热加载：只有出现了「能热加载的段」才该换句柄、重建工具。
+    ///
+    /// `needs_restart` / `rejected` 只该告警：它们对应的段在换句柄前会被回填成
+    /// 旧值（见 `main.rs` 的 `keep_pending_sections`），于是「文件值 vs 句柄值」
+    /// 的差异会**永久存在**。若把它们也算成「有变化」，用户改过一次 device 段
+    /// 之后，此后每次 SIGHUP 都会白重建一次工具服务器并重连 MCP（后者单 server
+    /// 最坏 20 秒）——一条会被真实使用习惯踩到的路径。
+    pub fn should_apply(&self) -> bool {
+        !self.applied.is_empty()
+    }
 }
 
 /// 比较两份配置，按「能不能热加载」分类。
@@ -756,8 +767,8 @@ fn resolve_optional_path(root: &Path, path: &mut Option<PathBuf>) {
 mod tests {
     use super::{
         classify_config_change, openai_base_url, openai_realtime_base_url, timeout_duration,
-        AppConfig, AsrConfig, AsrProvider, ConfigHandle, LlmConfig, LlmProtocol, LlmThinkingMode,
-        McpConfig,
+        AppConfig, AsrConfig, AsrProvider, ConfigChanges, ConfigHandle, LlmConfig, LlmProtocol,
+        LlmThinkingMode, McpConfig,
     };
     use std::sync::Arc;
 
@@ -946,6 +957,29 @@ mod tests {
         );
         assert!(changes.needs_restart.is_empty());
         assert!(changes.rejected.is_empty());
+    }
+
+    /// 只有热加载段才触发重载；`needs_restart` / `rejected` 单独出现时不该白重建。
+    #[test]
+    fn should_apply_only_when_a_hot_section_changed() {
+        let only_pending = ConfigChanges {
+            needs_restart: vec!["device"],
+            ..ConfigChanges::default()
+        };
+        assert!(!only_pending.should_apply(), "改 device 段不该触发重建");
+
+        let only_rejected = ConfigChanges {
+            rejected: vec!["runtime.speech_socket"],
+            ..ConfigChanges::default()
+        };
+        assert!(!only_rejected.should_apply(), "只改 socket 也不该触发重建");
+
+        let with_applied = ConfigChanges {
+            applied: vec!["llm"],
+            needs_restart: vec!["device"],
+            ..ConfigChanges::default()
+        };
+        assert!(with_applied.should_apply());
     }
 
     #[tokio::test]

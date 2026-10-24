@@ -80,14 +80,27 @@ pub struct AgentControl {
     pub end_reason: String,
 }
 
+/// 一轮对话需要的「配置快照 + 工具服务器」视图。
+///
+/// 两者必须**一起**换，不能分两次写：`preamble` 由 `config.agent.tools_enabled`
+/// 决定，工具由 `tool_server` 提供。分开换就会出现窗口「preamble 说有工具、
+/// 服务器里其实没有」（`false → true` 时模型会去调不存在的工具，这一轮必炸），
+/// 反向则是「说没工具、工具在」的静默退化。
+///
+/// 放同一个 `RwLock` 里整体替换，读侧一次读、永远自洽。
+#[derive(Clone)]
+struct AgentView {
+    config: Arc<AppConfig>,
+    tool_server: ToolServerHandle,
+}
+
 pub struct AgentRuntime {
-    /// 可整体替换的配置句柄（SIGHUP 热加载）。每轮取一次快照，所以一轮对话
-    /// 全程用同一份配置，不会中途换模型。
+    /// 只用于 `reload` 取最新配置；一轮对话读的是 `view.config`（与工具同源）。
     config: ConfigHandle,
     /// 重建工具服务器时需要（音乐工具要它）。
     music: Arc<MusicService>,
-    /// 工具服务器与 MCP 连接都可以在 `reload` 里整体替换，所以放 RwLock 后。
-    tool_server: RwLock<ToolServerHandle>,
+    /// 配置快照与工具服务器的原子组合，见 `AgentView`。
+    view: RwLock<AgentView>,
     mcp: RwLock<McpConnections>,
     history: Mutex<Vec<HistoryTurn>>,
     control: Arc<Mutex<AgentControl>>,
@@ -184,9 +197,13 @@ impl AgentRuntime {
         let control = Arc::new(Mutex::new(AgentControl::default()));
         let snapshot = config.get().await;
         let tool_server = build_tool_server(snapshot.clone(), music.clone(), control.clone());
+        let view = AgentView {
+            config: snapshot.clone(),
+            tool_server,
+        };
 
         let mcp = if snapshot.agent.tools_enabled {
-            McpConnections::connect(snapshot.clone(), tool_server.clone()).await
+            McpConnections::connect(snapshot.clone(), view.tool_server.clone()).await
         } else {
             McpConnections::empty()
         };
@@ -203,7 +220,7 @@ impl AgentRuntime {
         Ok(Self {
             config,
             music,
-            tool_server: RwLock::new(tool_server),
+            view: RwLock::new(view),
             mcp: RwLock::new(mcp),
             history: Mutex::new(Vec::new()),
             control,
@@ -222,13 +239,18 @@ impl AgentRuntime {
         let snapshot = self.config.get().await;
         let tool_server =
             build_tool_server(snapshot.clone(), self.music.clone(), self.control.clone());
+        let next_view = AgentView {
+            config: snapshot.clone(),
+            tool_server,
+        };
+        // 慢的那几步（MCP 重连）全在换之前做完，换的时候只剩一次写锁。
         let mcp = if snapshot.agent.tools_enabled {
-            McpConnections::connect(snapshot.clone(), tool_server.clone()).await
+            McpConnections::connect(snapshot.clone(), next_view.tool_server.clone()).await
         } else {
             McpConnections::empty()
         };
 
-        *self.tool_server.write().await = tool_server;
+        *self.view.write().await = next_view;
         // 旧连接一定要 drop：McpConnections 的 Drop 会 abort 各个 supervisor，
         // 不 drop 旧连接会一直在后台重连。
         let previous = std::mem::replace(&mut *self.mcp.write().await, mcp);
@@ -242,8 +264,10 @@ impl AgentRuntime {
     }
 
     pub async fn run_turn(&self, message: &str) -> anyhow::Result<AgentTurnResult> {
-        // 一轮对话只取一次配置快照：中途发生 SIGHUP 也不会「前半句旧模型、后半句新模型」。
-        let config = self.config.get().await;
+        // 一轮对话只读一次视图：中途发生 SIGHUP 也不会「前半句旧模型、后半句新模型」，
+        // 而且配置与工具服务器同源，preamble 与实际注册的工具永远对得上。
+        let view = self.view.read().await.clone();
+        let config = view.config.clone();
         {
             let mut control = self.control.lock().await;
             control.should_end = false;
@@ -262,7 +286,7 @@ impl AgentRuntime {
 
         // 历史按结构化消息传给模型，不再拼成「最近对话历史：…」那一段文字。
         let history = self.history_snapshot().await;
-        let text = self.prompt_once(message_with_time, history).await?;
+        let text = self.prompt_once(view, message_with_time, history).await?;
 
         let control = self.control.lock().await;
         self.push_history(message, &text).await;
@@ -306,27 +330,39 @@ impl AgentRuntime {
         )
     }
 
-    async fn prompt_once(&self, prompt: String, history: Vec<Message>) -> anyhow::Result<String> {
-        let config = self.config.get().await;
+    async fn prompt_once(
+        &self,
+        view: AgentView,
+        prompt: String,
+        history: Vec<Message>,
+    ) -> anyhow::Result<String> {
+        let config = view.config.clone();
         let http_client = reqwest::Client::builder()
             .timeout(timeout_duration(config.llm.timeout_s))
             .build()
             .context("failed to create LLM HTTP client")?;
 
         match config.llm.protocol {
-            LlmProtocol::OpenAiChat => self.prompt_openai(http_client, prompt, history).await,
-            LlmProtocol::Anthropic => self.prompt_anthropic(http_client, prompt, history).await,
+            LlmProtocol::OpenAiChat => {
+                self.prompt_openai(view.clone(), http_client, prompt, history)
+                    .await
+            }
+            LlmProtocol::Anthropic => {
+                self.prompt_anthropic(view, http_client, prompt, history)
+                    .await
+            }
         }
     }
 
     async fn prompt_openai(
         &self,
+        view: AgentView,
         http_client: reqwest::Client,
         prompt: String,
         history: Vec<Message>,
     ) -> anyhow::Result<String> {
-        let config = self.config.get().await;
-        let tool_server = self.tool_server.read().await.clone();
+        let config = view.config.clone();
+        let tool_server = view.tool_server.clone();
         let client = openai::Client::builder()
             .api_key(config.llm.api_key.as_str())
             .base_url(config.llm.base_url.as_str())
@@ -355,12 +391,13 @@ impl AgentRuntime {
 
     async fn prompt_anthropic(
         &self,
+        view: AgentView,
         http_client: reqwest::Client,
         prompt: String,
         history: Vec<Message>,
     ) -> anyhow::Result<String> {
-        let config = self.config.get().await;
-        let tool_server = self.tool_server.read().await.clone();
+        let config = view.config.clone();
+        let tool_server = view.tool_server.clone();
         // 老版 Claude 要求 1024 <= budget_tokens < max_tokens；默认配置是
         // budget 1024 / max_tokens 300，直接开 thinking 会每轮失败并播"大模型服务遇到问题"。
         // 这里改成自动收敛并告警，不让纯配置陷阱把音箱弄哑。
