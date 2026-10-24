@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use anyhow::Context;
 use rand::RngCore;
 use reqwest::Client;
@@ -9,7 +7,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 use url::Url;
 
-use crate::config::{require_music_enabled, timeout_duration, AppConfig};
+use crate::config::{require_music_enabled, timeout_duration, AppConfig, ConfigHandle};
 use crate::device::Device;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +43,9 @@ enum InterruptionAction {
 }
 
 pub struct MusicService {
-    config: Arc<AppConfig>,
+    /// 可整体替换的配置句柄（SIGHUP 热加载）。音乐段的字段都是「用的时候才读」，
+    /// 所以换掉句柄里的快照即可生效，不需要重建服务。
+    config: ConfigHandle,
     device: Device,
     client: Client,
     state: Mutex<MusicState>,
@@ -53,7 +53,7 @@ pub struct MusicService {
 }
 
 impl MusicService {
-    pub fn new(config: Arc<AppConfig>, device: Device) -> anyhow::Result<Self> {
+    pub fn new(config: ConfigHandle, device: Device) -> anyhow::Result<Self> {
         Ok(Self {
             config,
             device,
@@ -71,8 +71,12 @@ impl MusicService {
     }
 
     pub async fn request_login_code(&self) -> Value {
+        let snapshot = self.config.get().await;
         match self
-            .netease_request("/captcha/sent", &[("phone", self.netease_phone())])
+            .netease_request(
+                "/captcha/sent",
+                &[("phone", Self::netease_phone(&snapshot))],
+            )
             .await
         {
             Ok(data) => data,
@@ -81,7 +85,8 @@ impl MusicService {
     }
 
     pub async fn submit_login_code(&self, code: &str) -> Value {
-        let phone = self.netease_phone();
+        let snapshot = self.config.get().await;
+        let phone = Self::netease_phone(&snapshot);
         let verified = self
             .netease_request(
                 "/captcha/verify",
@@ -258,7 +263,8 @@ impl MusicService {
     }
 
     pub async fn interrupt_for_wake(&self) -> bool {
-        let mode = self.interruption_mode();
+        let snapshot = self.config.get().await;
+        let mode = Self::interruption_mode(&snapshot);
         {
             let state = self.state.lock().await;
             if state.interruption.is_some() {
@@ -348,8 +354,9 @@ impl MusicService {
     }
 
     async fn search_inner(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Song>> {
-        require_music_enabled(&self.config)?;
-        match self.config.music.provider.as_str() {
+        let snapshot = self.config.get().await;
+        require_music_enabled(&snapshot)?;
+        match snapshot.music.provider.as_str() {
             "netease" => self.search_netease(query, limit).await,
             "navidrome" => self.search_navidrome(query, limit).await,
             other => anyhow::bail!("Unsupported music provider: {other}"),
@@ -357,8 +364,9 @@ impl MusicService {
     }
 
     async fn random_songs(&self, limit: usize) -> anyhow::Result<Vec<Song>> {
-        require_music_enabled(&self.config)?;
-        match self.config.music.provider.as_str() {
+        let snapshot = self.config.get().await;
+        require_music_enabled(&snapshot)?;
+        match snapshot.music.provider.as_str() {
             "navidrome" => {
                 let data = self
                     .navidrome_request("/rest/getRandomSongs.view", &[("size", limit.to_string())])
@@ -390,7 +398,8 @@ impl MusicService {
     }
 
     async fn song_detail(&self, song_id: &str) -> anyhow::Result<Song> {
-        match self.config.music.provider.as_str() {
+        let snapshot = self.config.get().await;
+        match snapshot.music.provider.as_str() {
             "navidrome" => {
                 let data = self
                     .navidrome_request("/rest/getSong.view", &[("id", song_id.to_string())])
@@ -410,15 +419,16 @@ impl MusicService {
     }
 
     async fn song_url(&self, song_id: &str) -> anyhow::Result<String> {
-        match self.config.music.provider.as_str() {
-            "navidrome" => self.navidrome_stream_url(song_id),
+        let snapshot = self.config.get().await;
+        match snapshot.music.provider.as_str() {
+            "navidrome" => Self::navidrome_stream_url(&snapshot, song_id),
             _ => {
                 let data = self
                     .netease_request(
                         "/song/url/v1",
                         &[
                             ("id", song_id.to_string()),
-                            ("level", self.config.music.netease.default_level.clone()),
+                            ("level", snapshot.music.netease.default_level.clone()),
                         ],
                     )
                     .await?;
@@ -468,8 +478,8 @@ impl MusicService {
         Ok(item)
     }
 
-    fn interruption_mode(&self) -> InterruptionAction {
-        match self.config.music.interruption.mode.trim() {
+    fn interruption_mode(config: &AppConfig) -> InterruptionAction {
+        match config.music.interruption.mode.trim() {
             "duck" | "lower_volume" | "volume" => InterruptionAction::Duck,
             "none" | "keep_playing" => InterruptionAction::None,
             _ => InterruptionAction::Pause,
@@ -521,10 +531,11 @@ impl MusicService {
         path: &str,
         params: &[(&str, String)],
     ) -> anyhow::Result<Value> {
-        require_music_enabled(&self.config)?;
+        let snapshot = self.config.get().await;
+        require_music_enabled(&snapshot)?;
         self.ensure_netease_server().await?;
         let cookie = self.read_cookie().await;
-        let mut url = Url::parse(&self.config.music.netease.api_base_url)?;
+        let mut url = Url::parse(&snapshot.music.netease.api_base_url)?;
         url.set_path(path);
         {
             let mut pairs = url.query_pairs_mut();
@@ -540,7 +551,7 @@ impl MusicService {
         Ok(self
             .client
             .get(url)
-            .timeout(timeout_duration(self.config.music.netease.timeout_s))
+            .timeout(timeout_duration(snapshot.music.netease.timeout_s))
             .send()
             .await?
             .json::<Value>()
@@ -552,16 +563,17 @@ impl MusicService {
         path: &str,
         params: &[(&str, String)],
     ) -> anyhow::Result<Value> {
-        let mut url = Url::parse(&self.config.music.navidrome.base_url)?;
+        let snapshot = self.config.get().await;
+        let mut url = Url::parse(&snapshot.music.navidrome.base_url)?;
         url.set_path(path);
-        let (salt, token) = subsonic_token(&self.config.music.navidrome.password);
+        let (salt, token) = subsonic_token(&snapshot.music.navidrome.password);
         {
             let mut pairs = url.query_pairs_mut();
             pairs
-                .append_pair("u", &self.config.music.navidrome.username)
+                .append_pair("u", &snapshot.music.navidrome.username)
                 .append_pair("t", &token)
                 .append_pair("s", &salt)
-                .append_pair("v", &self.config.music.navidrome.api_version)
+                .append_pair("v", &snapshot.music.navidrome.api_version)
                 .append_pair("c", "xiaoai-agent")
                 .append_pair("f", "json");
             for (key, value) in params {
@@ -571,7 +583,7 @@ impl MusicService {
         let data = self
             .client
             .get(url)
-            .timeout(timeout_duration(self.config.music.navidrome.timeout_s))
+            .timeout(timeout_duration(snapshot.music.navidrome.timeout_s))
             .send()
             .await?
             .json::<Value>()
@@ -592,15 +604,15 @@ impl MusicService {
         Ok(response.clone())
     }
 
-    fn navidrome_stream_url(&self, song_id: &str) -> anyhow::Result<String> {
-        let mut url = Url::parse(&self.config.music.navidrome.base_url)?;
+    fn navidrome_stream_url(config: &AppConfig, song_id: &str) -> anyhow::Result<String> {
+        let mut url = Url::parse(&config.music.navidrome.base_url)?;
         url.set_path("/rest/stream.view");
-        let (salt, token) = subsonic_token(&self.config.music.navidrome.password);
+        let (salt, token) = subsonic_token(&config.music.navidrome.password);
         url.query_pairs_mut()
-            .append_pair("u", &self.config.music.navidrome.username)
+            .append_pair("u", &config.music.navidrome.username)
             .append_pair("t", &token)
             .append_pair("s", &salt)
-            .append_pair("v", &self.config.music.navidrome.api_version)
+            .append_pair("v", &config.music.navidrome.api_version)
             .append_pair("c", "xiaoai-agent")
             .append_pair("f", "json")
             .append_pair("id", song_id);
@@ -608,11 +620,12 @@ impl MusicService {
     }
 
     async fn ensure_netease_server(&self) -> anyhow::Result<()> {
+        let snapshot = self.config.get().await;
         if self
             .client
             .get(format!(
                 "{}/login/status",
-                self.config.music.netease.api_base_url.trim_end_matches('/')
+                snapshot.music.netease.api_base_url.trim_end_matches('/')
             ))
             .timeout(timeout_duration(3.0))
             .send()
@@ -623,15 +636,16 @@ impl MusicService {
         }
         anyhow::bail!(
             "Netease API is not reachable at {}; run the API service externally and set music.netease.api_base_url",
-            self.config.music.netease.api_base_url
+            snapshot.music.netease.api_base_url
         );
     }
 
     async fn read_cookie(&self) -> Option<String> {
+        let snapshot = self.config.get().await;
         if let Some(cookie) = self.netease_cookie.lock().await.clone() {
             return Some(cookie);
         }
-        let path = self.config.music.netease.cookie_file.as_ref()?;
+        let path = snapshot.music.netease.cookie_file.as_ref()?;
         let text = tokio::fs::read_to_string(path).await.ok()?;
         serde_json::from_str::<Value>(&text)
             .ok()
@@ -652,11 +666,11 @@ impl MusicService {
         *self.netease_cookie.lock().await = Some(cookie.to_string());
     }
 
-    fn netease_phone(&self) -> String {
-        if !self.config.music.netease.phone.trim().is_empty() {
-            self.config.music.netease.phone.trim().to_string()
+    fn netease_phone(config: &AppConfig) -> String {
+        if !config.music.netease.phone.trim().is_empty() {
+            config.music.netease.phone.trim().to_string()
         } else {
-            self.config.music.netease.account.trim().to_string()
+            config.music.netease.account.trim().to_string()
         }
     }
 }
