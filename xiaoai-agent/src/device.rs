@@ -109,10 +109,9 @@ impl Device {
     /// `pnshelper` 追问、故障让位都属于这一类。绕开这里直接调
     /// `shell::run_shell` 会让那条路径重新变成不可测。
     pub async fn run_raw(&self, script: &str, limit: Duration) -> anyhow::Result<CommandResult> {
-        self.runner
-            .run(script, limit)
-            .await
-            .map_err(|err| anyhow::anyhow!("{err}"))
+        // 不再 `map_err(|err| anyhow!("{err}"))` 压成字符串：`ShellRunner` 直接返回
+        // `anyhow::Result`，`io::Error` 的 source chain 会一路带到日志里。
+        self.runner.run(script, limit).await
     }
 
     async fn run_script(&self, script: &str) -> anyhow::Result<()> {

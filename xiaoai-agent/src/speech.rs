@@ -146,6 +146,8 @@ impl SpeechTurn {
         mpsc::Sender<SpeechInput>,
         std::sync::Arc<tokio::sync::Mutex<Vec<TestCommand>>>,
     ) {
+        // 这里的 handle 可以直接丢：`turn` 自己还持有一份 `command_tx`，命令通道
+        // 因此不会关闭，常驻应答任务也不会提前退出——断言不会看到空 vec。
         let (turn, input_tx, recorded, _handle) = Self::for_test_with_handle(id);
         (turn, input_tx, recorded)
     }

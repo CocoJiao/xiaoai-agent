@@ -1,7 +1,6 @@
 mod agent;
 mod airplay;
 mod asr;
-mod base;
 mod capture;
 mod config;
 mod device;
@@ -637,8 +636,16 @@ async fn run_session(
         turn = match timeout(idle_timeout, followup_rx.recv()).await {
             Ok(Some(turn)) => turn,
             Ok(None) => {
-                speech.finish_dialog(turn_id).await?;
-                state.agent.reset_session("speech frontend stopped").await;
+                // follow-up 发送端没了：会话是正常收尾，不是失败。用 `?` 会让
+                // finish_dialog 的错误把整轮判成 Err，从而给「连续 3 轮失败让位」
+                // 白记一次，并且跳过 reset_session。
+                interrupt_turn(
+                    &state,
+                    &speech,
+                    turn_id,
+                    InterruptCause::Failure("speech frontend stopped"),
+                )
+                .await;
                 return Ok(());
             }
             Err(_) => {
@@ -984,6 +991,19 @@ mod tests {
         let shell = Arc::new(RecordingShell::exiting_with(
             1,
             "another launcher operation is in progress",
+        ));
+        let device = Device::with_runner(DeviceConfig::default(), shell);
+        let launcher = Path::new("/data/open-xiaoai/start-agent.sh");
+
+        assert!(!yield_to_native(&device, Some(launcher), "fatal").await);
+    }
+
+    /// 让位命令**本身没跑成**（超时 / 无法 fork）也必须如实返回 false。
+    /// 退出码 1 是运维唯一能把「让位了」和「以为让位了」区分开的地方。
+    #[tokio::test]
+    async fn yield_to_native_reports_an_unexecutable_command() {
+        let shell = Arc::new(RecordingShell::cannot_run(
+            "shell command timed out after 180s: start-agent.sh stop",
         ));
         let device = Device::with_runner(DeviceConfig::default(), shell);
         let launcher = Path::new("/data/open-xiaoai/start-agent.sh");

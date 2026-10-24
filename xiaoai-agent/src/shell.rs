@@ -5,8 +5,6 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::base::AppError;
-
 /// 默认单条 shell 命令的最长执行时间（可由 device.command_timeout_s 覆盖）。
 /// 设备上 tts_play.sh / miplayer 一旦卡住（ALSA 占用、播放队列堵），
 /// 没有超时就会把整轮对话永久挂住。
@@ -28,8 +26,12 @@ pub struct CommandResult {
 /// shell 执行体返回的未来。手写 box 而不是引 `async-trait`：
 /// trait 方法需要对象安全（`Device` 要存 `Arc<dyn ShellRunner>`），
 /// 而 `async fn` 在 trait 里还不是 dyn-compatible。
-pub type ShellFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<CommandResult, AppError>> + Send + 'a>>;
+///
+/// 错误类型统一成 `anyhow::Error`，而不是原来的 `Box<dyn Error + Send + Sync>`：
+/// 后者塞不进 `anyhow::Error`（`Box<dyn Error>` 本身不实现 `std::error::Error`），
+/// 调用方只能把它压成字符串，于是 `io::Error` 的 source chain 就丢了——排查
+/// `run_shell` 的 fork/exec 失败时，那一层恰恰最有用。
+pub type ShellFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<CommandResult>> + Send + 'a>>;
 
 /// 设备命令的唯一执行出口。
 ///
@@ -162,7 +164,7 @@ impl ShellRunner for RecordingShell {
         let _ = limit;
         Box::pin(async move {
             if let Some(message) = reply.error {
-                return Err(message.into());
+                return Err(anyhow::anyhow!("{message}"));
             }
             Ok(CommandResult {
                 stdout: reply.stdout,
@@ -173,7 +175,7 @@ impl ShellRunner for RecordingShell {
     }
 }
 
-pub async fn run_shell(script: &str, limit: Duration) -> Result<CommandResult, AppError> {
+pub async fn run_shell(script: &str, limit: Duration) -> anyhow::Result<CommandResult> {
     // kill_on_drop: 上层 abort 掉本轮任务时，sh 及其子进程必须一起死，
     // 否则旧 TTS 会继续出声、与新回答叠在一起（双播）。
     let fut = Command::new("/bin/sh")
@@ -186,7 +188,9 @@ pub async fn run_shell(script: &str, limit: Duration) -> Result<CommandResult, A
         Ok(res) => res?,
         Err(_) => {
             let brief: String = script.chars().take(80).collect();
-            return Err(format!("{TIMEOUT_ERROR_PREFIX} after {limit:?}: {brief}").into());
+            return Err(anyhow::anyhow!(
+                "{TIMEOUT_ERROR_PREFIX} after {limit:?}: {brief}"
+            ));
         }
     };
 
