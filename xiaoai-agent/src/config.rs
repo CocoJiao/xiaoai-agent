@@ -1,8 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
+use tokio::sync::RwLock;
+
 use crate::shell::DEFAULT_COMMAND_TIMEOUT;
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -619,6 +622,119 @@ pub fn openai_realtime_base_url(raw: &str) -> String {
     }
 }
 
+/// 可整体替换的配置句柄。
+///
+/// 选 `RwLock<Arc<AppConfig>>` 而不是引 `arc-swap`：零新依赖，读侧只是
+/// 「拿读锁 → clone 一个 Arc → 放锁」，锁不跨 await。每次取一份快照，
+/// 于是「一轮对话全程用同一份配置」天然成立，不会查到半新半旧的状态。
+#[derive(Clone)]
+pub struct ConfigHandle {
+    inner: Arc<RwLock<Arc<AppConfig>>>,
+}
+
+impl ConfigHandle {
+    pub fn new(config: Arc<AppConfig>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(config)),
+        }
+    }
+
+    /// 取一份当前配置快照（拿到就立刻放锁，凭 Arc 生存）。
+    pub async fn get(&self) -> Arc<AppConfig> {
+        self.inner.read().await.clone()
+    }
+
+    /// 整体替换，返回被换下来的旧配置。
+    pub async fn replace(&self, next: Arc<AppConfig>) -> Arc<AppConfig> {
+        std::mem::replace(&mut *self.inner.write().await, next)
+    }
+}
+
+/// 一次配置重载里各配置段的去向。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ConfigChanges {
+    /// 热加载生效，下一次用到就是新值。
+    pub applied: Vec<&'static str>,
+    /// 只有重启才生效：本次保留旧值，调用方据此告警。
+    pub needs_restart: Vec<&'static str>,
+    /// 明确拒绝的段：运行中无法切换（目前只有 socket），其余段照常生效。
+    pub rejected: Vec<&'static str>,
+}
+
+impl ConfigChanges {
+    pub fn is_noop(&self) -> bool {
+        self.applied.is_empty() && self.needs_restart.is_empty() && self.rejected.is_empty()
+    }
+
+    /// 是否真的值得热加载：只有出现了「能热加载的段」才该换句柄、重建工具。
+    ///
+    /// `needs_restart` / `rejected` 只该告警：它们对应的段在换句柄前会被回填成
+    /// 旧值（见 `main.rs` 的 `keep_pending_sections`），于是「文件值 vs 句柄值」
+    /// 的差异会**永久存在**。若把它们也算成「有变化」，用户改过一次 device 段
+    /// 之后，此后每次 SIGHUP 都会白重建一次工具服务器并重连 MCP（后者单 server
+    /// 最坏 20 秒）——一条会被真实使用习惯踩到的路径。
+    pub fn should_apply(&self) -> bool {
+        !self.applied.is_empty()
+    }
+}
+
+/// 比较两份配置，按「能不能热加载」分类。
+///
+/// 用 Debug 快照比较，而不是给 25 个配置结构逐个补 `PartialEq`：它们全是
+/// `#[derive(Debug, Deserialize)]` 的纯数据，Debug 输出现即字段全集，比较结果
+/// 与逐字段 Eq 等价；这样既不用改 25 处 derive，也没有「新加字段忘了比较」的
+/// 风险——字段进了结构就自动进比较。
+fn section_changed<T: std::fmt::Debug>(old: &T, new: &T) -> bool {
+    format!("{old:?}") != format!("{new:?}")
+}
+
+pub fn classify_config_change(old: &AppConfig, new: &AppConfig) -> ConfigChanges {
+    let mut changes = ConfigChanges::default();
+
+    // 运行中不可能换 speech socket：SpeechService 已经绑在这个路径上了，
+    // 换路径等于让 mipns 和 agent 各说各话。
+    if section_changed(&old.runtime.speech_socket, &new.runtime.speech_socket) {
+        changes.rejected.push("runtime.speech_socket");
+    }
+    if section_changed(
+        &old.runtime.session_idle_timeout_s,
+        &new.runtime.session_idle_timeout_s,
+    ) {
+        changes.applied.push("runtime.session_idle_timeout_s");
+    }
+    // 下面这些段都是「用的时候才读字段」，换掉句柄里的 Arc 就生效。
+    if section_changed(&old.capture, &new.capture) {
+        changes.applied.push("capture");
+    }
+    if section_changed(&old.llm, &new.llm) {
+        changes.applied.push("llm");
+    }
+    if section_changed(&old.agent, &new.agent) {
+        changes.applied.push("agent");
+    }
+    if section_changed(&old.music, &new.music) {
+        changes.applied.push("music");
+    }
+    if section_changed(&old.mcp, &new.mcp) {
+        changes.applied.push("mcp");
+    }
+    // device: Device 启动时把 DeviceConfig 克隆走了（TTS 模板、命令超时、LED id），
+    // 只换配置会让「模板还是旧命令、ID 是新的」，所以整段按需重启处理。
+    if section_changed(&old.device, &new.device) {
+        changes.needs_restart.push("device");
+    }
+    // asr: AsrClient 构造时选定了 provider 并克隆了整段配置（含 realtime 客户端）。
+    if section_changed(&old.asr, &new.asr) {
+        changes.needs_restart.push("asr");
+    }
+    // airplay: 接收端在启动时建好监听，重启有端口/句柄占用风险。
+    if section_changed(&old.airplay, &new.airplay) {
+        changes.needs_restart.push("airplay");
+    }
+
+    changes
+}
+
 pub fn require_music_enabled(config: &AppConfig) -> anyhow::Result<()> {
     anyhow::ensure!(config.music.enabled, "music.enabled is false");
     Ok(())
@@ -650,9 +766,11 @@ fn resolve_optional_path(root: &Path, path: &mut Option<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        openai_base_url, openai_realtime_base_url, timeout_duration, AppConfig, AsrConfig, AsrProvider, LlmConfig,
-        LlmProtocol, LlmThinkingMode, McpConfig,
+        classify_config_change, openai_base_url, openai_realtime_base_url, timeout_duration,
+        AppConfig, AsrConfig, AsrProvider, ConfigChanges, ConfigHandle, LlmConfig, LlmProtocol,
+        LlmThinkingMode, McpConfig,
     };
+    use std::sync::Arc;
 
     #[test]
     fn example_uses_external_asr_by_default() {
@@ -747,8 +865,14 @@ mod tests {
     fn base_url_keeps_empty_input_as_is() {
         assert_eq!(openai_base_url(""), "");
         assert_eq!(openai_realtime_base_url(""), "");
-        assert_eq!(timeout_duration(f64::INFINITY), std::time::Duration::from_secs(30));
-        assert_eq!(timeout_duration(f64::NAN), std::time::Duration::from_secs(30));
+        assert_eq!(
+            timeout_duration(f64::INFINITY),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            timeout_duration(f64::NAN),
+            std::time::Duration::from_secs(30)
+        );
     }
 
     #[test]
@@ -780,5 +904,95 @@ mod tests {
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.servers[0].name, "home_assistant");
         assert_eq!(config.servers[0].tools, ["ha_search", "ha_get_state"]);
+    }
+
+    /// 同一份配置重载不应被当成「有变化」（否则每次 SIGHUP 都白白重建工具和 MCP）。
+    #[test]
+    fn classify_reports_noop_for_identical_config() {
+        let config = AppConfig::default();
+        assert!(classify_config_change(&config, &config).is_noop());
+    }
+
+    /// socket 是唯一被拒绝的段：SpeechService 已经绑在上面，换路径没有意义。
+    #[test]
+    fn classify_rejects_speech_socket_change() {
+        let old = AppConfig::default();
+        let mut new = AppConfig::default();
+        new.runtime.speech_socket = "/tmp/other/speech.usock".to_string();
+        let changes = classify_config_change(&old, &new);
+        assert_eq!(changes.rejected, vec!["runtime.speech_socket"]);
+        assert!(changes.applied.is_empty());
+        assert!(changes.needs_restart.is_empty());
+    }
+
+    /// 启动时被克隆走的段（device / asr / airplay）只能重启生效，不能假装热加载。
+    #[test]
+    fn classify_marks_snapshotted_sections_as_needing_restart() {
+        let old = AppConfig::default();
+        let mut new = AppConfig::default();
+        new.device.tts_command = "/usr/sbin/tts_play.sh --notify-pns -v 90 {text}".to_string();
+        new.asr.open_ai.model = "whisper-large-v3".to_string();
+        new.airplay.enabled = true;
+        let changes = classify_config_change(&old, &new);
+        assert_eq!(changes.needs_restart, vec!["device", "asr", "airplay"]);
+        assert!(
+            changes.applied.is_empty(),
+            "这三段不该被当成热加载生效: {changes:?}"
+        );
+    }
+
+    /// 「用的时候才读」的段必须进 applied，否则改完 yaml 用户以为生效了其实没有。
+    #[test]
+    fn classify_marks_per_use_sections_as_applied() {
+        let old = AppConfig::default();
+        let mut new = AppConfig::default();
+        new.llm.model = "another-model".to_string();
+        new.capture.sample_rate = 8000;
+        new.runtime.session_idle_timeout_s = 60.0;
+        new.agent.tools_enabled = false;
+        let changes = classify_config_change(&old, &new);
+        assert_eq!(
+            changes.applied,
+            vec!["runtime.session_idle_timeout_s", "capture", "llm", "agent"]
+        );
+        assert!(changes.needs_restart.is_empty());
+        assert!(changes.rejected.is_empty());
+    }
+
+    /// 只有热加载段才触发重载；`needs_restart` / `rejected` 单独出现时不该白重建。
+    #[test]
+    fn should_apply_only_when_a_hot_section_changed() {
+        let only_pending = ConfigChanges {
+            needs_restart: vec!["device"],
+            ..ConfigChanges::default()
+        };
+        assert!(!only_pending.should_apply(), "改 device 段不该触发重建");
+
+        let only_rejected = ConfigChanges {
+            rejected: vec!["runtime.speech_socket"],
+            ..ConfigChanges::default()
+        };
+        assert!(!only_rejected.should_apply(), "只改 socket 也不该触发重建");
+
+        let with_applied = ConfigChanges {
+            applied: vec!["llm"],
+            needs_restart: vec!["device"],
+            ..ConfigChanges::default()
+        };
+        assert!(with_applied.should_apply());
+    }
+
+    #[tokio::test]
+    async fn config_handle_returns_snapshots_and_old_value() {
+        let mut first = AppConfig::default();
+        first.llm.model = "first".to_string();
+        let handle = ConfigHandle::new(Arc::new(first));
+
+        let mut second = AppConfig::default();
+        second.llm.model = "second".to_string();
+        let previous = handle.replace(Arc::new(second)).await;
+
+        assert_eq!(previous.llm.model, "first", "replace 必须把旧配置交出来");
+        assert_eq!(handle.get().await.llm.model, "second");
     }
 }

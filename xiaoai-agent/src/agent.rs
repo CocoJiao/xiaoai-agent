@@ -6,10 +6,10 @@ use rig_core::completion::{Message, Prompt};
 use rig_core::providers::{anthropic, openai};
 use rig_core::tool::server::{ToolServer, ToolServerHandle};
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
-use crate::config::{timeout_duration, AppConfig, LlmProtocol, LlmThinkingMode};
+use crate::config::{timeout_duration, AppConfig, ConfigHandle, LlmProtocol, LlmThinkingMode};
 use crate::device::Device;
 use crate::mcp::McpConnections;
 use crate::music::MusicService;
@@ -80,12 +80,65 @@ pub struct AgentControl {
     pub end_reason: String,
 }
 
-pub struct AgentRuntime {
+/// 一轮对话需要的「配置快照 + 工具服务器」视图。
+///
+/// 两者必须**一起**换，不能分两次写：`preamble` 由 `config.agent.tools_enabled`
+/// 决定，工具由 `tool_server` 提供。分开换就会出现窗口「preamble 说有工具、
+/// 服务器里其实没有」（`false → true` 时模型会去调不存在的工具，这一轮必炸），
+/// 反向则是「说没工具、工具在」的静默退化。
+///
+/// 放同一个 `RwLock` 里整体替换，读侧一次读、永远自洽。
+#[derive(Clone)]
+struct AgentView {
     config: Arc<AppConfig>,
     tool_server: ToolServerHandle,
-    _mcp: McpConnections,
+}
+
+pub struct AgentRuntime {
+    /// 只用于 `reload` 取最新配置；一轮对话读的是 `view.config`（与工具同源）。
+    config: ConfigHandle,
+    /// 重建工具服务器时需要（音乐工具要它）。
+    music: Arc<MusicService>,
+    /// 配置快照与工具服务器的原子组合，见 `AgentView`。
+    view: RwLock<AgentView>,
+    mcp: RwLock<McpConnections>,
     history: Mutex<Vec<HistoryTurn>>,
     control: Arc<Mutex<AgentControl>>,
+}
+
+/// 按一份配置快照构建内置工具服务器。
+///
+/// 从 `new` 里提出来是为了 `reload` 能复用：工具结构体各自持有 `Arc<AppConfig>`
+/// 快照，所以「配置变了」只能在重建工具时生效，不能靠改字段。
+fn build_tool_server(
+    config: Arc<AppConfig>,
+    music: Arc<MusicService>,
+    control: Arc<Mutex<AgentControl>>,
+) -> ToolServerHandle {
+    let mut tool_server = ToolServer::new();
+    if config.agent.tools_enabled {
+        // 新增/删除工具时，必须同步 tools.rs 测试里的 all_definitions()：
+        // 那边是按这份列表手工抄的，数量断言靠它兜住。
+        tool_server = tool_server
+            .tool(GetCurrentTime::new(config.clone()))
+            .tool(GetWeather::new(config.clone()))
+            .tool(WebSearch::new(config.clone()))
+            .tool(EndConversation::new(control))
+            .tool(SearchMusic::new(music.clone()))
+            .tool(RequestMusicLoginCode::new(music.clone()))
+            .tool(SubmitMusicLoginCode::new(music.clone()))
+            .tool(PlayMusicQuery::new(music.clone()))
+            .tool(AddMusicToQueue::new(music.clone()))
+            .tool(AddRandomMusicToQueue::new(music.clone()))
+            .tool(PlayRandomMusic::new(music.clone()))
+            .tool(StopMusicPlayback::new(music.clone()))
+            .tool(PauseMusicPlayback::new(music.clone()))
+            .tool(ResumeMusicPlayback::new(music.clone()))
+            .tool(PlayNextMusic::new(music.clone()))
+            .tool(PlayPreviousMusic::new(music.clone()))
+            .tool(GetMusicStatus::new(music));
+    }
+    tool_server.run()
 }
 
 /// 一轮问答的结构化历史。
@@ -137,40 +190,20 @@ fn history_to_messages(turns: &[HistoryTurn]) -> Vec<Message> {
 
 impl AgentRuntime {
     pub async fn new(
-        config: Arc<AppConfig>,
+        config: ConfigHandle,
         device: Device,
         music: Arc<MusicService>,
     ) -> anyhow::Result<Self> {
         let control = Arc::new(Mutex::new(AgentControl::default()));
-        let mut tool_server = ToolServer::new();
-        if config.agent.tools_enabled {
-            // 新增/删除工具时，必须同步 tools.rs 测试里的 all_definitions()：
-            // 那边是按这份列表手工抄的，数量断言靠它兜住。
-            tool_server = tool_server
-                .tool(GetCurrentTime::new(config.clone()))
-                .tool(GetWeather::new(config.clone()))
-                .tool(WebSearch::new(config.clone()))
-                .tool(EndConversation::new(control.clone()))
-                .tool(SearchMusic::new(music.clone()))
-                .tool(RequestMusicLoginCode::new(music.clone()))
-                .tool(SubmitMusicLoginCode::new(music.clone()))
-                .tool(PlayMusicQuery::new(music.clone()))
-                .tool(AddMusicToQueue::new(music.clone()))
-                .tool(AddRandomMusicToQueue::new(music.clone()))
-                .tool(PlayRandomMusic::new(music.clone()))
-                .tool(StopMusicPlayback::new(music.clone()))
-                .tool(PauseMusicPlayback::new(music.clone()))
-                .tool(ResumeMusicPlayback::new(music.clone()))
-                .tool(PlayNextMusic::new(music.clone()))
-                .tool(PlayPreviousMusic::new(music.clone()))
-                .tool(GetMusicStatus::new(music));
-        } else {
-            let _ = &music; // 未启用工具时保持变量被使用
-        }
-        let tool_server = tool_server.run();
+        let snapshot = config.get().await;
+        let tool_server = build_tool_server(snapshot.clone(), music.clone(), control.clone());
+        let view = AgentView {
+            config: snapshot.clone(),
+            tool_server,
+        };
 
-        let mcp = if config.agent.tools_enabled {
-            McpConnections::connect(config.clone(), tool_server.clone()).await
+        let mcp = if snapshot.agent.tools_enabled {
+            McpConnections::connect(snapshot.clone(), view.tool_server.clone()).await
         } else {
             McpConnections::empty()
         };
@@ -178,22 +211,63 @@ impl AgentRuntime {
             warn!("initial stop_audio failed, continuing: {err:?}");
         }
         info!(
-            protocol = ?config.llm.protocol,
-            thinking = ?config.llm.thinking.mode,
-            model = %config.llm.model,
+            protocol = ?snapshot.llm.protocol,
+            thinking = ?snapshot.llm.thinking.mode,
+            model = %snapshot.llm.model,
             "LLM client configured"
         );
 
         Ok(Self {
             config,
-            tool_server,
-            _mcp: mcp,
+            music,
+            view: RwLock::new(view),
+            mcp: RwLock::new(mcp),
             history: Mutex::new(Vec::new()),
             control,
         })
     }
 
+    /// 配置热加载：换配置快照，并重建工具服务器与 MCP 连接。
+    ///
+    /// 必须重建工具：17 个内置工具各自持有 `Arc<AppConfig>` 快照（见
+    /// `build_tool_server`），不重建就只有 agent 主体换配置、工具还用旧的。
+    /// 而 MCP 工具也是注册在同一个 `ToolServer` 上的，所以换服务器必须连带重连，
+    /// 否则新服务器里一个 MCP 工具都没有。
+    ///
+    /// 不重建的是历史与 `control`：热加载不该把用户正在进行的对话抹掉。
+    pub async fn reload(&self) {
+        let snapshot = self.config.get().await;
+        let tool_server =
+            build_tool_server(snapshot.clone(), self.music.clone(), self.control.clone());
+        let next_view = AgentView {
+            config: snapshot.clone(),
+            tool_server,
+        };
+        // 慢的那几步（MCP 重连）全在换之前做完，换的时候只剩一次写锁。
+        let mcp = if snapshot.agent.tools_enabled {
+            McpConnections::connect(snapshot.clone(), next_view.tool_server.clone()).await
+        } else {
+            McpConnections::empty()
+        };
+
+        *self.view.write().await = next_view;
+        // 旧连接一定要 drop：McpConnections 的 Drop 会 abort 各个 supervisor，
+        // 不 drop 旧连接会一直在后台重连。
+        let previous = std::mem::replace(&mut *self.mcp.write().await, mcp);
+        drop(previous);
+
+        info!(
+            tools_enabled = snapshot.agent.tools_enabled,
+            model = %snapshot.llm.model,
+            "agent 已按新配置重建工具服务器与 MCP 连接"
+        );
+    }
+
     pub async fn run_turn(&self, message: &str) -> anyhow::Result<AgentTurnResult> {
+        // 一轮对话只读一次视图：中途发生 SIGHUP 也不会「前半句旧模型、后半句新模型」，
+        // 而且配置与工具服务器同源，preamble 与实际注册的工具永远对得上。
+        let view = self.view.read().await.clone();
+        let config = view.config.clone();
         {
             let mut control = self.control.lock().await;
             control.should_end = false;
@@ -203,16 +277,16 @@ impl AgentRuntime {
         // 关闭工具时（例如后端代理不支持 tools API），模型拿不到当前时间，
         // 问"现在几点"会答"不方便查询"。默认只在没有工具时注入；
         // inject_current_time=true 可强制注入（工具存在时也能省一次工具调用）。
-        let inject_time = self.config.agent.inject_current_time || !self.config.agent.tools_enabled;
+        let inject_time = config.agent.inject_current_time || !config.agent.tools_enabled;
         let message_with_time = if inject_time {
-            format!("{}{}", self.now_prefix(), message)
+            format!("{}{}", self.now_prefix(&config.agent.timezone), message)
         } else {
             message.to_string()
         };
 
         // 历史按结构化消息传给模型，不再拼成「最近对话历史：…」那一段文字。
         let history = self.history_snapshot().await;
-        let text = self.prompt_once(message_with_time, history).await?;
+        let text = self.prompt_once(view, message_with_time, history).await?;
 
         let control = self.control.lock().await;
         self.push_history(message, &text).await;
@@ -224,8 +298,11 @@ impl AgentRuntime {
     }
 
     /// 按是否注册工具选择 preamble，避免"命令模型调用不存在的工具"。
-    fn preamble(&self) -> &'static str {
-        if self.config.agent.tools_enabled {
+    ///
+    /// 参数化而不是读 `self.config`：热加载后工具可能刚被重建，preamble 必须跟
+    /// 同一份快照走，否则会出现「preamble 说没工具、工具其实在」。
+    fn preamble(tools_enabled: bool) -> &'static str {
+        if tools_enabled {
             SPEAKER_AGENT_INSTRUCTIONS
         } else {
             SPEAKER_AGENT_INSTRUCTIONS_NO_TOOLS
@@ -233,14 +310,9 @@ impl AgentRuntime {
     }
 
     /// 把当前时间写进用户消息，供关闭工具时的模型使用。
-    fn now_prefix(&self) -> String {
+    fn now_prefix(&self, timezone: &str) -> String {
         use chrono::Utc;
-        let tz: chrono_tz::Tz = self
-            .config
-            .agent
-            .timezone
-            .parse()
-            .unwrap_or(chrono_tz::Asia::Shanghai);
+        let tz: chrono_tz::Tz = timezone.parse().unwrap_or(chrono_tz::Asia::Shanghai);
         let now = Utc::now().with_timezone(&tz);
         let weekday = match now.format("%u").to_string().as_str() {
             "1" => "一",
@@ -258,40 +330,55 @@ impl AgentRuntime {
         )
     }
 
-    async fn prompt_once(&self, prompt: String, history: Vec<Message>) -> anyhow::Result<String> {
+    async fn prompt_once(
+        &self,
+        view: AgentView,
+        prompt: String,
+        history: Vec<Message>,
+    ) -> anyhow::Result<String> {
+        let config = view.config.clone();
         let http_client = reqwest::Client::builder()
-            .timeout(timeout_duration(self.config.llm.timeout_s))
+            .timeout(timeout_duration(config.llm.timeout_s))
             .build()
             .context("failed to create LLM HTTP client")?;
 
-        match self.config.llm.protocol {
-            LlmProtocol::OpenAiChat => self.prompt_openai(http_client, prompt, history).await,
-            LlmProtocol::Anthropic => self.prompt_anthropic(http_client, prompt, history).await,
+        match config.llm.protocol {
+            LlmProtocol::OpenAiChat => {
+                self.prompt_openai(view.clone(), http_client, prompt, history)
+                    .await
+            }
+            LlmProtocol::Anthropic => {
+                self.prompt_anthropic(view, http_client, prompt, history)
+                    .await
+            }
         }
     }
 
     async fn prompt_openai(
         &self,
+        view: AgentView,
         http_client: reqwest::Client,
         prompt: String,
         history: Vec<Message>,
     ) -> anyhow::Result<String> {
+        let config = view.config.clone();
+        let tool_server = view.tool_server.clone();
         let client = openai::Client::builder()
-            .api_key(self.config.llm.api_key.as_str())
-            .base_url(self.config.llm.base_url.as_str())
+            .api_key(config.llm.api_key.as_str())
+            .base_url(config.llm.base_url.as_str())
             .http_client(http_client)
             .build()
             .context("failed to create OpenAI-compatible Rig client")?
             .completions_api();
 
         let agent = client
-            .agent(self.config.llm.model.as_str())
-            .preamble(self.preamble())
-            .temperature(self.config.llm.temperature)
-            .max_tokens(self.config.llm.max_tokens)
+            .agent(config.llm.model.as_str())
+            .preamble(Self::preamble(config.agent.tools_enabled))
+            .temperature(config.llm.temperature)
+            .max_tokens(config.llm.max_tokens)
             .default_max_turns(3)
-            .additional_params(openai_thinking_params(&self.config.llm.thinking.mode))
-            .tool_server_handle(self.tool_server.clone())
+            .additional_params(openai_thinking_params(&config.llm.thinking.mode))
+            .tool_server_handle(tool_server.clone())
             .build();
 
         // 历史以结构化消息挂到请求上；空历史不必多挂一层。
@@ -304,21 +391,22 @@ impl AgentRuntime {
 
     async fn prompt_anthropic(
         &self,
+        view: AgentView,
         http_client: reqwest::Client,
         prompt: String,
         history: Vec<Message>,
     ) -> anyhow::Result<String> {
+        let config = view.config.clone();
+        let tool_server = view.tool_server.clone();
         // 老版 Claude 要求 1024 <= budget_tokens < max_tokens；默认配置是
         // budget 1024 / max_tokens 300，直接开 thinking 会每轮失败并播"大模型服务遇到问题"。
         // 这里改成自动收敛并告警，不让纯配置陷阱把音箱弄哑。
-        let mut thinking_params = anthropic_thinking_params(
-            &self.config.llm.thinking.mode,
-            self.config.llm.thinking.budget_tokens,
-        );
-        if self.config.llm.thinking.mode == LlmThinkingMode::Enabled {
+        let mut thinking_params =
+            anthropic_thinking_params(&config.llm.thinking.mode, config.llm.thinking.budget_tokens);
+        if config.llm.thinking.mode == LlmThinkingMode::Enabled {
             const MIN_BUDGET: u64 = 1024;
-            let max = self.config.llm.max_tokens;
-            let wanted = self.config.llm.thinking.budget_tokens;
+            let max = config.llm.max_tokens;
+            let wanted = config.llm.thinking.budget_tokens;
             if wanted < MIN_BUDGET || wanted >= max {
                 // 合法区间是 [1024, max_tokens)。区间为空说明 max_tokens 太小，
                 // 静默给一个非法值只会换来 400，这里直接报出人话错误。
@@ -333,29 +421,28 @@ impl AgentRuntime {
                     clamped,
                     "llm.thinking.budget_tokens out of range, clamped into [1024, max_tokens)"
                 );
-                thinking_params =
-                    anthropic_thinking_params(&LlmThinkingMode::Enabled, clamped);
+                thinking_params = anthropic_thinking_params(&LlmThinkingMode::Enabled, clamped);
             }
         }
 
         let client = anthropic::Client::builder()
-            .api_key(self.config.llm.api_key.as_str())
-            .base_url(self.config.llm.base_url.as_str())
+            .api_key(config.llm.api_key.as_str())
+            .base_url(config.llm.base_url.as_str())
             .http_client(http_client)
             .anthropic_version("2023-06-01")
             .build()
             .context("failed to create Anthropic-compatible Rig client")?;
 
         let mut builder = client
-            .agent(self.config.llm.model.as_str())
-            .preamble(self.preamble())
-            .max_tokens(self.config.llm.max_tokens)
+            .agent(config.llm.model.as_str())
+            .preamble(Self::preamble(config.agent.tools_enabled))
+            .max_tokens(config.llm.max_tokens)
             .default_max_turns(3)
             .additional_params(thinking_params);
-        if self.config.llm.thinking.mode != LlmThinkingMode::Enabled {
-            builder = builder.temperature(self.config.llm.temperature);
+        if config.llm.thinking.mode != LlmThinkingMode::Enabled {
+            builder = builder.temperature(config.llm.temperature);
         }
-        let agent = builder.tool_server_handle(self.tool_server.clone()).build();
+        let agent = builder.tool_server_handle(tool_server.clone()).build();
 
         // 历史以结构化消息挂到请求上；空历史不必多挂一层。
         let mut request = agent.prompt(prompt);

@@ -81,6 +81,49 @@ Rules:
   continue for recoverable `errno`s, fatal only for an unusable socket) needs
   its own bounded-retry design and is not implemented yet.
 
+## Configuration Hot Reload
+
+`SIGHUP` re-reads `agent.yaml` in place. The reload is deliberately conservative —
+it never halves a config:
+
+| Section | On reload |
+|---|---|
+| `runtime.session_idle_timeout_s`, `capture`, `llm`, `agent`, `music`, `mcp` | applied on the next turn (read per use, or re-registered by rebuilding the tool server) |
+| `device`, `asr`, `airplay` | **needs restart** — these are snapshotted at startup (`Device` keeps its template/timeout copy, `AsrClient` picks a provider, the AirPlay receiver owns its listener). The reload keeps the old values and warns |
+| `runtime.speech_socket` | **rejected** — `SpeechService` is already bound to the path; switching it would leave mipns and the agent talking to different sockets |
+
+Rules that must survive future refactors:
+
+- `ConfigHandle` only ever holds the configuration that is **actually in effect**.
+  Pending (`needs_restart`) and rejected sections are rolled back to their old
+  values before the swap (as are rejected ones), so reading the handle never
+  reports a change that the running process did not take.
+- Only a **hot** section triggers the swap and the tool rebuild. A `SIGHUP` whose
+  diff is entirely `needs_restart` / `rejected` is a warning-only no-op — otherwise
+  "file differs from handle" would be permanent (the handle keeps the old values
+  by design) and every later `SIGHUP` would rebuild the tool server and reconnect
+  MCP for nothing.
+- The reload runs in a **spawned task**, never inline in the event loop: MCP
+  reconnect is bounded by `2 × server.timeout_s` per server (20 s default), and
+  during that window `speech.recv()` must keep being polled or wake events and
+  `Fatal`-triggered yielding are delayed. Overlapping `SIGHUP`s are **coalesced**:
+  a request arriving mid-reload is remembered and triggers one more round that
+  re-reads the file (never silently dropped — otherwise the *first*, possibly
+  wrong, edit would win), and the running flag is released by an **RAII guard** so
+  a panicking reload cannot leave hot reload disabled forever.
+- Inside `AgentRuntime`, the config snapshot and the tool server are swapped
+  **together** through one `AgentView` (`RwLock<AgentView>`), and one view is read
+  per turn and threaded down. Swapping them separately would leave a window where
+  the preamble says "you have tools" while the server has none (or the reverse).
+- A malformed `agent.yaml` must never take the speaker down: `AppConfig::load`
+  failing means "keep the old config and warn", not "exit".
+- `agent.tools_enabled` and any tool-facing section (`weather`, `web_search`,
+  `music`, MCP endpoints) only take effect through a **rebuilt** `ToolServer`.
+  The 17 built-in tools each capture an `Arc<AppConfig>` snapshot, and the MCP
+  tools are registered into the same server, so `AgentRuntime::reload` rebuilds
+  both and reconnects MCP. Conversation history and `AgentControl` are kept —
+  a reload must not wipe the dialog the user is in the middle of.
+
 ## Cross Compilation
 
 Do not assume this project cannot be cross-compiled locally.

@@ -14,7 +14,7 @@ mod vad;
 mod weather;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +32,7 @@ use crate::asr::AsrClient;
 use crate::capture::{
     record_utterance, record_utterance_server_vad_streaming, record_utterance_streaming,
 };
-use crate::config::{AppConfig, DeviceConfig};
+use crate::config::{classify_config_change, AppConfig, ConfigChanges, ConfigHandle, DeviceConfig};
 use crate::device::Device;
 use crate::music::MusicService;
 use crate::speech::{SpeechHandle, SpeechService, SpeechServiceEvent, SpeechTurn};
@@ -55,27 +55,34 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let config = Arc::new(
+    let config = ConfigHandle::new(Arc::new(
         AppConfig::load(&cli.config)
             .with_context(|| format!("failed to load config {}", cli.config.display()))?,
-    );
-    let mut speech = SpeechService::bind(&config.runtime.speech_socket).await?;
+    ));
+    // 启动期快照：socket / device / asr / airplay 四段按「改完要重启」处理，
+    // 所以这里取一次就够；llm / agent / music / capture 走句柄，随时可热加载。
+    let initial = config.get().await;
+    let mut speech = SpeechService::bind(&initial.runtime.speech_socket).await?;
     let speech_handle = speech.handle();
 
-    let device = Device::new(config.device.clone());
-    let asr = AsrClient::new(config.asr.clone())?;
+    let device = Device::new(initial.device.clone());
+    let asr = AsrClient::new(initial.asr.clone())?;
     let music = Arc::new(MusicService::new(config.clone(), device.clone())?);
-    let airplay = AirPlayService::start(config.airplay.clone()).await?;
+    let airplay = AirPlayService::start(initial.airplay.clone()).await?;
     let agent = Arc::new(AgentRuntime::new(config.clone(), device.clone(), music.clone()).await?);
     let failures = Arc::new(AtomicU32::new(0));
+    let (reload_tx, mut reload_rx) = mpsc::channel::<()>(1);
+    spawn_sighup_listener(reload_tx);
+    // 重载去抖门：同时只跑一个，期间的请求合并成下一轮。
+    let reload_gate = Arc::new(ReloadGate::default());
     let launcher = launcher_path();
     if launcher.is_none() {
         warn!("找不到 start-agent.sh：故障时无法主动让位，只能退出等 watchdog 重启");
     }
 
-    info!(socket = %config.runtime.speech_socket, "xiaoai-agent ready");
+    info!(socket = %initial.runtime.speech_socket, "xiaoai-agent ready");
     device
-        .blink_ready(config.device.led_listening, Duration::from_millis(250))
+        .blink_ready(initial.device.led_listening, Duration::from_millis(250))
         .await;
 
     let mut active_session: Option<ActiveSession> = None;
@@ -110,7 +117,8 @@ async fn main() -> anyhow::Result<()> {
                             }
                             let _ = active.task.await;
                             let state = build_turn_state(
-                                &config, &device, &asr, &agent, &music, &airplay, &failures,
+                                &config, &initial.device, &device, &asr, &agent, &music,
+                                &airplay, &failures,
                             );
                             // 服务已经报故障，收尾命令可能没人应答；给 2s 上限，
                             // 别让「让位」本身卡在一个等不到回复的 oneshot 上。
@@ -137,7 +145,8 @@ async fn main() -> anyhow::Result<()> {
                             "WAKE native mipns"
                         );
                         let state = build_turn_state(
-                            &config, &device, &asr, &agent, &music, &airplay, &failures,
+                            &config, &initial.device, &device, &asr, &agent, &music, &airplay,
+                            &failures,
                         );
                         if let Some(active) = active_session.take() {
                             let interrupted = active.turn_id.load(Ordering::Relaxed);
@@ -164,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
                             device.abort_current_output().await;
                         }
                         // LED 清理留在这一层：任务已被 abort，run_turn 的尾巴跑不到。
-                        cleanup_turn_leds(&device, &config.device).await;
+                        cleanup_turn_leds(&device, &initial.device).await;
 
                         let (followup_tx, followup_rx) = mpsc::channel(2);
                         let handle = speech_handle.clone();
@@ -209,6 +218,12 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            Some(()) = reload_rx.recv() => {
+                // 重载不进主循环：MCP 重连单 server 最坏 20 秒（mcp.rs 的
+                // 2×timeout_s 上限），这段时间必须继续 poll 语音事件——
+                // 语音是这台设备唯一的命脉，配置重载是可以等的东西。
+                spawn_config_reload(&config, cli.config.clone(), &agent, &reload_gate);
+            }
             _ = session_check.tick() => {
                 let session_finished = active_session
                     .as_ref()
@@ -233,7 +248,7 @@ async fn main() -> anyhow::Result<()> {
                         std::process::exit(if yielded { 0 } else { 1 });
                     }
                     device
-                        .blink_ready(config.device.led_listening, Duration::from_millis(250))
+                        .blink_ready(initial.device.led_listening, Duration::from_millis(250))
                         .await;
                 }
             }
@@ -328,7 +343,14 @@ async fn interrupt_turn(
 
 #[derive(Clone)]
 struct TurnState {
-    config: Arc<AppConfig>,
+    /// 热加载句柄：每轮取一次快照，所以改完 yaml 下一轮就生效。
+    config: ConfigHandle,
+    /// LED id 来自启动期快照（device 段按「改完要重启」处理，不能一半新一半旧）。
+    ///
+    /// 注意这是**第二份真值**：它与 `config.get().device` 恒等，靠
+    /// `keep_pending_sections` 把 device 段回填成旧值来维持。改造 device 段的
+    /// 热加载时，这两处必须一起改，否则会出现「LED 用新 id、TTS 用旧模板」。
+    led: DeviceConfig,
     device: Device,
     asr: AsrClient,
     agent: Arc<AgentRuntime>,
@@ -344,7 +366,8 @@ struct TurnState {
 const YIELD_AFTER_CONSECUTIVE_FAILURES: u32 = 3;
 
 fn build_turn_state(
-    config: &Arc<AppConfig>,
+    config: &ConfigHandle,
+    led: &DeviceConfig,
     device: &Device,
     asr: &AsrClient,
     agent: &Arc<AgentRuntime>,
@@ -354,6 +377,7 @@ fn build_turn_state(
 ) -> TurnState {
     TurnState {
         config: config.clone(),
+        led: led.clone(),
         device: device.clone(),
         asr: asr.clone(),
         agent: agent.clone(),
@@ -361,6 +385,192 @@ fn build_turn_state(
         airplay: airplay.clone(),
         failures: failures.clone(),
     }
+}
+
+/// 把本次不生效的配置段（需重启 / 被拒绝）回填成旧值。
+///
+/// 这样 `ConfigHandle` 里始终是「当前真正在跑的配置」，热加载后读句柄不会读到
+/// 一份「device 是新值、实际 Device 还是旧模板」的假象。
+fn keep_pending_sections(
+    current: &AppConfig,
+    next: &Arc<AppConfig>,
+    changes: &ConfigChanges,
+) -> AppConfig {
+    let mut effective = (**next).clone();
+    for section in changes.rejected.iter().chain(changes.needs_restart.iter()) {
+        match *section {
+            "runtime.speech_socket" => {
+                effective.runtime.speech_socket = current.runtime.speech_socket.clone();
+            }
+            "device" => effective.device = current.device.clone(),
+            "asr" => effective.asr = current.asr.clone(),
+            "airplay" => effective.airplay = current.airplay.clone(),
+            other => warn!(section = other, "未知的待生效配置段，按旧值保留"),
+        }
+    }
+    effective
+}
+
+/// 监听 SIGHUP，只负责「通知主循环该重载了」。
+///
+/// 真正的重载在主循环里做：那样配置切换不会和一轮对话抢同一个 await 点，
+/// 也让 `apply_config_reload` 能脱离信号被单测直接调用。
+fn spawn_sighup_listener(tx: mpsc::Sender<()>) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::hangup()) {
+                Ok(mut stream) => {
+                    while stream.recv().await.is_some() {
+                        if tx.send(()).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(err) => warn!(error = %err, "无法安装 SIGHUP 处理器，配置热加载不可用"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            drop(tx);
+            warn!("SIGHUP 配置热加载只在 unix 上可用");
+        }
+    });
+}
+
+/// 重载去抖门：同一时刻只跑一个重载任务，期间的请求**合并**成「跑完再跑一轮」。
+///
+/// 为什么是合并而不是丢弃：重载要跑几十秒（MCP 重连），用户完全可能在这期间
+/// 发现自己写错了再改一次。丢弃的话最终生效的是**第一次那份**，用户只看到一条
+/// 很容易被当成噪音的 warn——那正好是「改了、发了信号、没生效」这个本 PR 要消灭的
+/// 失败模式。合并（每轮重读文件）等于「用最后的文件状态跑一次」。
+#[derive(Default)]
+struct ReloadGate {
+    running: AtomicBool,
+    pending: AtomicBool,
+}
+
+impl ReloadGate {
+    /// 抢占本轮执行权。`false` 表示已有任务在跑，本次请求已并入下一轮。
+    fn begin(&self) -> bool {
+        if self.running.swap(true, Ordering::AcqRel) {
+            self.pending.store(true, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
+    /// 一轮结束：还有合并进来的请求就返回 `true`（需要再跑一轮）。
+    fn finish_round(&self) -> bool {
+        self.pending.swap(false, Ordering::AcqRel)
+    }
+
+    fn release(&self) {
+        self.running.store(false, Ordering::Release);
+    }
+}
+
+/// 用 RAII 复位 `running`，而不是手动 `store(false)`。
+///
+/// 手动复位的版本一旦 `apply_config_reload` panic（rig 代码、分配失败、task 被
+/// abort），`running` 就永久停在 `true`，此后每次 SIGHUP 都在 `begin()` 处被拒，
+/// 热加载永久失效——而用户下次用到这个功能可能是几周后。
+struct ReloadGuard(Arc<ReloadGate>);
+
+impl Drop for ReloadGuard {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// 把一次重载丢到后台跑。
+///
+/// 为什么不在主循环里 `await`：`agent.reload()` 里含 MCP 重连，单 server 上限
+/// 2×`timeout_s`（默认 20 秒），多 server 累加。那段时间主循环不被 poll，
+/// `speech.recv()` 收不到唤醒、`session_check` 推迟失败检测、`Fatal` 触发的
+/// 让位也会被推迟——等于让一条配置重载堵住故障恢复路径。
+fn spawn_config_reload(
+    config: &ConfigHandle,
+    path: PathBuf,
+    agent: &Arc<AgentRuntime>,
+    gate: &Arc<ReloadGate>,
+) {
+    if !gate.begin() {
+        info!("配置重载进行中，本次 SIGHUP 合并到下一轮");
+        return;
+    }
+    let config = config.clone();
+    let agent = agent.clone();
+    let gate = gate.clone();
+    tokio::spawn(async move {
+        // 无论正常结束还是 panic 展开，都会把 running 复位。
+        let _guard = ReloadGuard(gate.clone());
+        loop {
+            apply_config_reload(&config, &path, &agent).await;
+            if !gate.finish_round() {
+                break;
+            }
+            info!("上一轮重载期间又来了一次 SIGHUP，按最新文件内容再跑一轮");
+        }
+    });
+}
+
+/// 执行一次配置重载：读文件 → 分类 → 换句柄 → 重建工具与 MCP。
+///
+/// 任何一步失败都保留旧配置：一份写坏的 yaml 不能让音箱因为一次 SIGHUP 变哑。
+async fn apply_config_reload(handle: &ConfigHandle, path: &Path, agent: &AgentRuntime) {
+    let current = handle.get().await;
+    let next = match AppConfig::load(path) {
+        Ok(next) => Arc::new(next),
+        Err(err) => {
+            warn!(
+                error = %err,
+                path = %path.display(),
+                "配置重载失败，继续使用旧配置"
+            );
+            return;
+        }
+    };
+
+    let changes = classify_config_change(&current, &next);
+    if !changes.rejected.is_empty() {
+        warn!(
+            rejected = ?changes.rejected,
+            "以下配置段运行中无法切换，本次忽略（其余段照常生效）"
+        );
+    }
+    if !changes.needs_restart.is_empty() {
+        warn!(
+            needs_restart = ?changes.needs_restart,
+            "以下配置段要重启 start-agent.sh 才生效，本次沿用旧值"
+        );
+    }
+
+    if !changes.should_apply() {
+        // 告警已经打过。两种「不用重载」给不同文案，但只需要这一处判断：
+        // is_noop 是 should_apply == false 的子集，并排写两个会让人以为有别的区别。
+        if changes.is_noop() {
+            info!("配置文件无变化，跳过重载");
+        } else {
+            info!("本次没有可热加载的段，句柄与工具服务器保持不变");
+        }
+        return;
+    }
+
+    // 关键不变量：句柄里的配置必须等于「运行中真正生效的配置」。
+    // 所以待重启段与拒绝段要回填旧值，否则读句柄的人会以为 device/asr 已经换了。
+    // 放在 should_apply 判断之后：省掉「确定不重载」时白 clone 一整份配置。
+    let effective = keep_pending_sections(&current, &next, &changes);
+    let previous = handle.replace(Arc::new(effective)).await;
+    // 工具结构体各自持有配置快照（见 agent.rs 的 build_tool_server），
+    // 所以换配置之后必须让 agent 重建工具服务器与 MCP 连接。
+    agent.reload().await;
+    info!(
+        applied = ?changes.applied,
+        "配置已热加载（下一轮生效）"
+    );
+    drop(previous);
 }
 
 /// `start-agent.sh` 的位置：优先 `XIAOAI_AGENT_HOME`，否则跟二进制同目录
@@ -469,7 +679,7 @@ async fn run_turn(
         // 一轮正常结束就清零：偶发失败不该累积成让位。
         state.failures.store(0, Ordering::Relaxed);
     }
-    cleanup_turn_leds(&state.device, &state.config.device).await;
+    cleanup_turn_leds(&state.device, &state.led).await;
     state.music.restore_after_interruption().await;
     state.airplay.restore_after_interruption().await;
     result
@@ -482,18 +692,20 @@ async fn run_session(
     mut followup_rx: mpsc::Receiver<SpeechTurn>,
     active_turn_id: Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
-    let led = &state.config.device;
-    let idle_timeout =
-        Duration::from_secs_f64(state.config.runtime.session_idle_timeout_s.max(1.0));
+    let led = &state.led;
 
     loop {
+        // 每轮重新取一次配置快照：SIGHUP 之后从下一轮开始用新值，而本轮
+        // 从头到尾是同一份配置。
+        let config = state.config.get().await;
+        let idle_timeout = Duration::from_secs_f64(config.runtime.session_idle_timeout_s.max(1.0));
         let turn_id = turn.id();
         active_turn_id.store(turn_id, Ordering::Relaxed);
         state.device.show_led(led.led_listening).await;
         let device_for_speech = state.device.clone();
         let maybe_stream = match state
             .asr
-            .start_streaming_transcription(state.config.capture.sample_rate)
+            .start_streaming_transcription(config.capture.sample_rate)
             .await
         {
             Ok(stream) => stream,
@@ -509,7 +721,7 @@ async fn run_session(
                 let led_user_speaking = led.led_user_speaking;
                 let led_thinking = led.led_thinking;
                 match record_utterance_server_vad_streaming(
-                    state.config.capture.clone(),
+                    config.capture.clone(),
                     idle_timeout,
                     &mut turn,
                     &mut stream,
@@ -547,7 +759,7 @@ async fn run_session(
                 let appender_for_reject = appender.clone();
                 let led_user_speaking = led.led_user_speaking;
                 let _pcm = match record_utterance_streaming(
-                    state.config.capture.clone(),
+                    config.capture.clone(),
                     idle_timeout,
                     &mut turn,
                     move || {
@@ -590,31 +802,30 @@ async fn run_session(
                 }
             }
         } else {
-            let pcm =
-                match record_utterance(state.config.capture.clone(), idle_timeout, &mut turn, {
-                    let led_user_speaking = led.led_user_speaking;
-                    move || {
-                        let device = device_for_speech.clone();
-                        async move {
-                            device.show_led(led_user_speaking).await;
-                        }
+            let pcm = match record_utterance(config.capture.clone(), idle_timeout, &mut turn, {
+                let led_user_speaking = led.led_user_speaking;
+                move || {
+                    let device = device_for_speech.clone();
+                    async move {
+                        device.show_led(led_user_speaking).await;
                     }
-                })
-                .await
-                {
-                    Ok(pcm) => pcm,
-                    Err(err) if is_capture_timeout(&err) => {
-                        info!(turn_id, "session idle timeout");
-                        interrupt_turn(&state, &speech, turn_id, InterruptCause::IdleTimeout).await;
-                        return Ok(());
-                    }
-                    Err(err) => return Err(err),
-                };
+                }
+            })
+            .await
+            {
+                Ok(pcm) => pcm,
+                Err(err) if is_capture_timeout(&err) => {
+                    info!(turn_id, "session idle timeout");
+                    interrupt_turn(&state, &speech, turn_id, InterruptCause::IdleTimeout).await;
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            };
 
             state.device.show_led(led.led_thinking).await;
             match state
                 .asr
-                .transcribe_pcm(&pcm, state.config.capture.sample_rate)
+                .transcribe_pcm(&pcm, config.capture.sample_rate)
                 .await
             {
                 Ok(text) => text,
@@ -744,19 +955,29 @@ mod tests {
     /// - `agent.tools_enabled=false` 让 `AgentRuntime::new` 走
     ///   `McpConnections::empty()`，不建 MCP 连接；
     /// - `airplay.enabled=false` 让 `AirPlayService::start` 只构造内存状态。
-    async fn test_state(shell: Arc<RecordingShell>) -> TurnState {
+    /// 测试基线配置：离线（不建 MCP、不建 realtime 流、不监听 AirPlay）。
+    fn base_test_config() -> AppConfig {
         let mut config = AppConfig::default();
         config.agent.tools_enabled = false;
         config.airplay.enabled = false;
         // record_utterance 内部会把上限抬到至少 1s，所以超时用例实跑约 1s。
         config.runtime.session_idle_timeout_s = 1.0;
-        let config = Arc::new(config);
-        let device = Device::with_runner(config.device.clone(), shell);
-        let asr = AsrClient::new(config.asr.clone()).expect("默认 ASR 配置应当可用");
+        config
+    }
+
+    async fn test_state(shell: Arc<RecordingShell>) -> TurnState {
+        test_state_with(base_test_config(), shell).await
+    }
+
+    async fn test_state_with(config: AppConfig, shell: Arc<RecordingShell>) -> TurnState {
+        let config = ConfigHandle::new(Arc::new(config));
+        let initial = config.get().await;
+        let device = Device::with_runner(initial.device.clone(), shell);
+        let asr = AsrClient::new(initial.asr.clone()).expect("默认 ASR 配置应当可用");
         let music = Arc::new(
             MusicService::new(config.clone(), device.clone()).expect("音乐服务构造不应失败"),
         );
-        let airplay = AirPlayService::start(config.airplay.clone())
+        let airplay = AirPlayService::start(initial.airplay.clone())
             .await
             .expect("airplay.enabled=false 时不应失败");
         let agent = Arc::new(
@@ -766,6 +987,7 @@ mod tests {
         );
         TurnState {
             config,
+            led: initial.device.clone(),
             device,
             asr,
             agent,
@@ -1048,6 +1270,187 @@ mod tests {
         let launcher = Path::new("/data/open-xiaoai/start-agent.sh");
 
         assert!(!yield_to_native(&device, Some(launcher), "fatal").await);
+    }
+
+    /// 一次热加载的全量用例配置：同时含「热加载段」和「需重启段」。
+    const RELOAD_YAML: &str = r#"runtime:
+  session_idle_timeout_s: 42
+llm:
+  model: reloaded-model
+device:
+  tts_command: "/usr/sbin/tts_play.sh --changed {text}"
+asr:
+  open_ai:
+    model: reloaded-asr
+agent:
+  tools_enabled: false
+"#;
+
+    /// 半截 yaml：故意破坏，用来验证「重载失败保留旧配置」。
+    const BROKEN_YAML: &str = "runtime: [not a mapping";
+
+    /// 改 socket + 一个合法热加载段：验证「拒绝 socket、但其余段照常生效」。
+    const SOCKET_YAML: &str = r#"runtime:
+  speech_socket: /tmp/other/speech.usock
+  session_idle_timeout_s: 7
+"#;
+
+    fn temp_config_path(tag: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "xiaoai-reload-{tag}-{}-{stamp}.yaml",
+            std::process::id()
+        ))
+    }
+
+    /// 重载期间的 SIGHUP 必须「合并成下一轮」，不能静默丢弃：否则用户改错再改回来、
+    /// 再发一次信号时，最终生效的还是第一次那份（写错的）。
+    #[test]
+    fn reload_gate_coalesces_requests_arriving_mid_reload() {
+        let gate = ReloadGate::default();
+        assert!(gate.begin(), "第一个请求拿到执行权");
+        assert!(!gate.begin(), "重载进行中：本次请求被并入下一轮");
+        assert!(gate.finish_round(), "有合并进来的请求，需要再跑一轮");
+        assert!(!gate.finish_round(), "没有新请求就结束");
+        gate.release();
+        assert!(gate.begin(), "释放之后又能接新请求");
+    }
+
+    /// N2 的回归：`running` 靠 RAII 复位，不能手动 store。
+    #[test]
+    fn reload_guard_releases_the_gate_on_drop() {
+        let gate = Arc::new(ReloadGate::default());
+        assert!(gate.begin());
+        {
+            let _guard = ReloadGuard(gate.clone());
+            assert!(!gate.begin(), "持锁期间不该再接新任务");
+        }
+        assert!(gate.begin(), "guard drop 之后必须已复位");
+    }
+
+    /// 真正会咬人的那一档：任务 panic 展开时也要复位。手动 `store(false)` 的写法
+    /// 在这里会把 running 永久留在 true，此后每次 SIGHUP 都静默失效。
+    #[test]
+    fn reload_guard_releases_the_gate_even_when_the_task_panics() {
+        let gate = Arc::new(ReloadGate::default());
+        assert!(gate.begin());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ReloadGuard(gate.clone());
+            panic!("simulated reload panic");
+        }));
+        assert!(outcome.is_err(), "这条用例本身要制造一次 panic");
+        assert!(
+            gate.begin(),
+            "panic 展开后 running 必须复位，否则热加载永久失效"
+        );
+    }
+
+    /// 热加载的核心承诺：能热加载的段立刻生效，需要重启的段在句柄里保持旧值。
+    /// 后者是「句柄 == 运行中真正生效的配置」这条不变量的实现方式。
+    #[tokio::test]
+    async fn config_reload_applies_hot_sections_and_keeps_pending_ones() {
+        let state = test_state(Arc::new(RecordingShell::always_ok())).await;
+        let before = state.config.get().await;
+        let path = temp_config_path("apply");
+        std::fs::write(&path, RELOAD_YAML).unwrap();
+
+        apply_config_reload(&state.config, &path, &state.agent).await;
+        let _ = std::fs::remove_file(&path);
+
+        let after = state.config.get().await;
+        assert_eq!(
+            after.runtime.session_idle_timeout_s, 42.0,
+            "runtime.session_idle_timeout_s 是热加载段"
+        );
+        assert_eq!(after.llm.model, "reloaded-model", "llm 段是热加载段");
+        assert_eq!(
+            after.device.tts_command, before.device.tts_command,
+            "device 段要重启才生效，句柄里必须还是旧值"
+        );
+        assert_eq!(
+            after.asr.open_ai.model, before.asr.open_ai.model,
+            "asr 段要重启才生效，句柄里必须还是旧值"
+        );
+    }
+
+    /// 一份写坏的 yaml 不能让音箱因为一次 SIGHUP 变哑：失败保留旧配置。
+    #[tokio::test]
+    async fn config_reload_keeps_old_config_when_the_file_is_broken() {
+        let state = test_state(Arc::new(RecordingShell::always_ok())).await;
+        let before = state.config.get().await;
+        let path = temp_config_path("broken");
+        std::fs::write(&path, BROKEN_YAML).unwrap();
+
+        apply_config_reload(&state.config, &path, &state.agent).await;
+        let _ = std::fs::remove_file(&path);
+
+        let after = state.config.get().await;
+        assert_eq!(after.llm.model, before.llm.model);
+        assert_eq!(
+            after.runtime.session_idle_timeout_s,
+            before.runtime.session_idle_timeout_s
+        );
+    }
+
+    /// 只改了 device（需重启）段：不该触发任何重载动作，句柄原样不动。
+    /// 这是 P3 那条「每发一次 SIGHUP 就白重建一次工具/MCP」的回归测试。
+    #[tokio::test]
+    async fn config_reload_is_a_noop_when_only_restart_sections_changed() {
+        let state = test_state(Arc::new(RecordingShell::always_ok())).await;
+        let before = state.config.get().await;
+        let path = temp_config_path("device-only");
+        std::fs::write(
+            &path,
+            // 热加载段保持与测试基线一致，只让 device 段不同——否则
+            // session_idle_timeout_s / agent.tools_enabled 会各自成为热加载变化。
+            "runtime:
+  session_idle_timeout_s: 1
+agent:
+  tools_enabled: false
+device:
+  tts_command: \"/usr/sbin/tts_play.sh --changed {text}\"
+",
+        )
+        .unwrap();
+
+        apply_config_reload(&state.config, &path, &state.agent).await;
+        let _ = std::fs::remove_file(&path);
+
+        let after = state.config.get().await;
+        assert_eq!(
+            after.device.tts_command, before.device.tts_command,
+            "device 段需要重启，句柄必须原样不动"
+        );
+        assert_eq!(
+            after.runtime.session_idle_timeout_s,
+            before.runtime.session_idle_timeout_s
+        );
+    }
+
+    /// socket 运行中不能换（SpeechService 已经绑在上面），但同一次重载里的
+    /// 其它段照常生效——不要因为一个字段就把整份配置丢掉。
+    #[tokio::test]
+    async fn config_reload_ignores_speech_socket_changes() {
+        let state = test_state(Arc::new(RecordingShell::always_ok())).await;
+        let before = state.config.get().await.runtime.speech_socket.clone();
+        let path = temp_config_path("socket");
+        std::fs::write(&path, SOCKET_YAML).unwrap();
+
+        apply_config_reload(&state.config, &path, &state.agent).await;
+        let _ = std::fs::remove_file(&path);
+
+        let after = state.config.get().await;
+        assert_eq!(
+            after.runtime.speech_socket, before,
+            "运行中换 socket 会让 mipns 和 agent 各说各话，必须拒绝"
+        );
+        assert_eq!(
+            after.runtime.session_idle_timeout_s, 7.0,
+            "同一份配置里的其它段不该被这个拒绝连累"
+        );
     }
 
     #[tokio::test]

@@ -650,8 +650,11 @@ mod tests {
     async fn all_definitions() -> Vec<ToolDefinition> {
         let config = example_config();
         let music = Arc::new(
-            MusicService::new(config.clone(), Device::new(config.device.clone()))
-                .expect("music service"),
+            MusicService::new(
+                crate::config::ConfigHandle::new(config.clone()),
+                Device::new(config.device.clone()),
+            )
+            .expect("music service"),
         );
         let control = Arc::new(Mutex::new(AgentControl::default()));
         vec![
