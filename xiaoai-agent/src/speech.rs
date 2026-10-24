@@ -146,6 +146,24 @@ impl SpeechTurn {
         mpsc::Sender<SpeechInput>,
         std::sync::Arc<tokio::sync::Mutex<Vec<TestCommand>>>,
     ) {
+        let (turn, input_tx, recorded, _handle) = Self::for_test_with_handle(id);
+        (turn, input_tx, recorded)
+    }
+
+    /// 同 `for_test`，额外把 `SpeechHandle` 交出来。
+    ///
+    /// `main.rs` 的 `interrupt_turn` 拿的是 `&SpeechHandle`（那一层不知道 turn
+    /// 对象），所以测它必须能单独发命令，并且命令要落进**同一个**记录器——
+    /// 否则「turn 自己的 stop_capture」和「中断路径的 finish_dialog」的先后
+    /// 顺序就没法一起断言。
+    pub fn for_test_with_handle(
+        id: u64,
+    ) -> (
+        Self,
+        mpsc::Sender<SpeechInput>,
+        std::sync::Arc<tokio::sync::Mutex<Vec<TestCommand>>>,
+        SpeechHandle,
+    ) {
         let (input_tx, input_rx) = mpsc::channel(64);
         let (command_tx, mut command_rx) = mpsc::channel::<ServiceCommand>(16);
         let recorded = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -162,15 +180,16 @@ impl SpeechTurn {
                 let _ = command.result_tx.send(Ok(()));
             }
         });
+        let handle = SpeechHandle { command_tx };
         let turn = Self {
             id,
             activation: ActivationMode::Wakeup,
             interaction_mode: 0,
             input_rx,
-            handle: SpeechHandle { command_tx },
+            handle: handle.clone(),
             stop_requested: false,
         };
-        (turn, input_tx, recorded)
+        (turn, input_tx, recorded, handle)
     }
 }
 
