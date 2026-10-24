@@ -35,6 +35,7 @@ use crate::capture::{
 use crate::config::{classify_config_change, AppConfig, ConfigChanges, ConfigHandle, DeviceConfig};
 use crate::device::Device;
 use crate::music::MusicService;
+use crate::shell::TIMEOUT_ERROR_PREFIX;
 use crate::speech::{SocketOwnership, SpeechHandle, SpeechService, SpeechServiceEvent, SpeechTurn};
 
 const ASR_SERVICE_ERROR_PROMPT: &str = "抱歉，语音识别服务遇到问题，请稍后重试";
@@ -520,6 +521,17 @@ async fn yield_after_consecutive_failures(
     if outcome.succeeded() {
         return Some(0);
     }
+    // 「让位失败」不是一种状态。超时意味着脚本可能正停在还原中途（保护已卸、
+    // 原生 socket 还没 mv 回），而 watchdog 早在 restore 第 2 步就被停了。
+    // 这种情况下继续运行 = LED 照常闪、进程照常在、但麦克风不工作、没人兜底，
+    // 比退出更难被发现。所以超时一律判失败退出，只有「脚本根本没动前端」
+    // 那一类（锁冲突、launcher 不存在等）才继续运行。
+    if outcome.timed_out {
+        error!(
+            "让位命令超时：脚本可能停在还原中途，判失败并退出（继续运行会表现为「一切正常但麦克风不工作」）"
+        );
+        return Some(1);
+    }
     warn!("故障让位未成功，继续运行；连续失败计数已清零，攒够再试");
     failures.store(0, Ordering::Relaxed);
     None
@@ -654,6 +666,9 @@ fn launcher_path() -> Option<PathBuf> {
 struct YieldOutcome {
     issued: bool,
     taken_over: bool,
+    /// 命令超时（脚本可能仍停在还原中途）。超时是「脚本正在跑」的最强信号，
+    /// 此时任何 inode 快照都不可靠，不能当成「什么都没发生」。
+    timed_out: bool,
 }
 
 impl YieldOutcome {
@@ -677,6 +692,7 @@ async fn yield_to_native(
         return YieldOutcome {
             issued: false,
             taken_over: ownership.taken_over(),
+            timed_out: false,
         };
     };
     let script = format!(
@@ -690,6 +706,7 @@ async fn yield_to_native(
     );
     // 走 detached 通道：还原序列必须能跑完。用普通通道的话，180s 超时会连带
     // 杀掉正在 restore 的 /bin/sh，停在「保护已卸、原生 socket 还没 mv 回」的中间态。
+    let mut timed_out = false;
     let issued = match device.run_detached(&script, Duration::from_secs(180)).await {
         Ok(result) if result.exit_code == 0 => {
             info!("launcher stop 已执行，原厂前端应当已恢复");
@@ -704,7 +721,8 @@ async fn yield_to_native(
             false
         }
         Err(err) => {
-            error!(error = %err, "让位命令没能执行");
+            timed_out = err.to_string().contains(TIMEOUT_ERROR_PREFIX);
+            error!(error = %err, timed_out, "让位命令没能执行");
             false
         }
     };
@@ -734,7 +752,11 @@ async fn yield_to_native(
         };
         warn!(socket = %ownership.path().display(), "{detail}");
     }
-    YieldOutcome { issued, taken_over }
+    YieldOutcome {
+        issued,
+        taken_over,
+        timed_out,
+    }
 }
 
 async fn reject_orphaned_turn(mut turn: SpeechTurn, speech: &SpeechHandle) {
@@ -1436,6 +1458,33 @@ mod tests {
         .await;
 
         assert_eq!(code, Some(0), "让位成功才退出");
+        let _ = std::fs::remove_file(owned.path());
+    }
+
+    /// 让位**超时**不能算「脚本没动前端」：脚本可能正停在还原中途，此时
+    /// watchdog 已停、保护已卸，继续运行会表现为「LED 正常闪但麦克风不工作」。
+    #[tokio::test]
+    async fn consecutive_failures_exit_when_the_yield_timed_out() {
+        let shell = Arc::new(RecordingShell::cannot_run(
+            "shell command timed out after 180s: /data/open-xiaoai/start-agent.sh stop",
+        ));
+        let device = Device::with_runner(DeviceConfig::default(), shell);
+        let failures = Arc::new(AtomicU32::new(YIELD_AFTER_CONSECUTIVE_FAILURES));
+        let owned = still_owned_socket("streak-timeout");
+
+        let code = yield_after_consecutive_failures(
+            &device,
+            Some(Path::new("/data/open-xiaoai/start-agent.sh")),
+            &owned,
+            &failures,
+        )
+        .await;
+
+        assert_eq!(
+            code,
+            Some(1),
+            "超时说明脚本可能停在还原中途，必须退出而不是假装健康"
+        );
         let _ = std::fs::remove_file(owned.path());
     }
 
