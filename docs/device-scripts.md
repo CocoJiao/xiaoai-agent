@@ -13,6 +13,8 @@
 | ✅ 念一句话（不通知 pns） | `/usr/sbin/tts_play.sh {text}` | `device.tts_command`（L06A 等） | 部分机型没有 `--notify-pns` 参数，见第四节 |
 | ✅ 主动播报 | `/usr/sbin/tts_play.sh "<文本>" -n` | — | `-n` 发 pns 事件，适合提醒/简报这类「它自己开口」（参数出处：参考实现仓库里拷贝的设备脚本 `docs/shells/tts_play.sh`；本仓库没有该脚本的副本） |
 | ✅ 放网络音频 | `killall miplayer 2>/dev/null; miplayer -f {url} >/tmp/xiaoai-miplayer.log 2>&1 &` | `device.play_url_command` | 后台起播；不要等它返回，否则一条命令就吃掉整个超时预算 |
+| ✅ 放**本地**音频文件 | `killall miplayer 2>/dev/null; miplayer -f /tmp/x.wav >/tmp/xiaoai-miplayer.log 2>&1 &` | `tts.playback_command` | OH2P 1.62.2 实测同样可用（日志 `event(Playing)` → `mCoreStatus:3` → `event(EndReached)`）；`miplayer` 播完**不会自己退出**，下次播放前必须 `killall` |
+| ✅ 裸 PCM 直出 | `/usr/bin/aplay /tmp/x.wav` | — | OH2P 1.62.2 实测 `aplay rc=0`，pns 在跑也没报 device busy；`/usr/bin/aplay` 存在。适合将来压首句延迟，但要自己管解码与 ALSA 冲突，当前未使用 |
 | ✅ 停止出声 | `killall tts_play.sh miplayer 2>/dev/null; mphelper pause` | `device.stop_audio_command` | 打断用户说话时最先调这个 |
 | ✅ 暂停/继续音乐 | `mphelper pause` / `mphelper play` | `device.pause_audio_command` / `resume_audio_command` | 音乐通道；对 TTS 无效 |
 | ✅ 压低音乐 | `amixer sset mysoftvol 25%`，恢复时写回原值 | `device.duck_audio_command` / `unduck_audio_command` | `mysoftvol` 是这台机器的软件音量控件；改前先读原值存 `/tmp` |
@@ -34,7 +36,7 @@
 
 ```sh
 # 1) 脚本真的存在，参数真的支持
-ls -l /usr/sbin/tts_play.sh /usr/bin/mphelper /usr/bin/miplayer 2>&1
+ls -l /usr/sbin/tts_play.sh /usr/bin/mphelper /usr/bin/miplayer /usr/bin/aplay 2>&1
 grep -n "notify-pns" /usr/sbin/tts_play.sh          # 没输出就是这机型不支持
 
 # 2) 出声的到底是不是这条路
