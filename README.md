@@ -233,6 +233,12 @@ Agent 启动后会常驻运行：
 
 本项目使用的补丁固件提供 SSH 和 `/data/init.sh` 通用开机入口，也可以用于启动其他自定义程序，并不要求运行 `xiaoai-agent`。停用或卸载 Agent 后，这些能力和禁用 OTA 等固件补丁仍然保留。
 
+### 故障让位
+
+Agent 运行期间如果语音前端报出致命错误（`speech.usock` 协议层不可继续），或者连续多轮会话都失败，它会主动执行一次 `start-agent.sh stop`，把麦克风还给原厂小爱，然后退出——而不是留在一副"能唤醒、但没人答"的状态里干等看门狗。让位之后音箱停在原厂状态，watchdog 也已被停掉，直到有人再次执行 `start-agent.sh start`。
+
+看门狗（`start-agent.sh` 后台循环）与 Agent 内的让位是两件事：看门狗只管进程级重启（进程没了、socket 被替换、保护挂载消失），Agent 内的让位只管协议级恢复。两者的分工写在 [AGENTS.md](./AGENTS.md) 的 "Fault Handling Boundary" 一节。
+
 ## TODO
 
 - [ ] 支持音箱按键控制

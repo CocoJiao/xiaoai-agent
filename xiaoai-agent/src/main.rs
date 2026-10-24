@@ -14,8 +14,8 @@ mod tools;
 mod vad;
 mod weather;
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,6 +68,11 @@ async fn main() -> anyhow::Result<()> {
     let music = Arc::new(MusicService::new(config.clone(), device.clone())?);
     let airplay = AirPlayService::start(config.airplay.clone()).await?;
     let agent = Arc::new(AgentRuntime::new(config.clone(), device.clone(), music.clone()).await?);
+    let failures = Arc::new(AtomicU32::new(0));
+    let launcher = launcher_path();
+    if launcher.is_none() {
+        warn!("找不到 start-agent.sh：故障时无法主动让位，只能退出等 watchdog 重启");
+    }
 
     info!(socket = %config.runtime.speech_socket, "xiaoai-agent ready");
     device
@@ -82,27 +87,59 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             event = speech.recv() => {
                 let Some(event) = event else {
-                    anyhow::bail!("speech.usock service stopped unexpectedly");
+                    // 服务任务自己结束了：和 Fatal 同一类故障，先让位再退出。
+                    let yielded = yield_to_native(
+                        &device,
+                        launcher.as_deref(),
+                        "speech.usock service stopped",
+                    )
+                    .await;
+                    std::process::exit(if yielded { 0 } else { 1 });
                 };
                 match event {
                     SpeechServiceEvent::Registered { vendor, codec } => {
                         info!(vendor, codec = codec.as_deref().unwrap_or("pcm16"), "speech frontend registered");
                     }
-                    SpeechServiceEvent::Fatal(message) => anyhow::bail!(message),
+                    SpeechServiceEvent::Fatal(message) => {
+                        // 协议级故障不再直接 bail 等 watchdog 在几十秒后重启。
+                        // 先把手上这一轮收干净，再把麦克风还给原厂小爱。
+                        error!(reason = %message, "speech frontend reported a fatal error");
+                        if let Some(active) = active_session.take() {
+                            let interrupted = active.turn_id.load(Ordering::Relaxed);
+                            if !active.task.is_finished() {
+                                active.task.abort();
+                            }
+                            let _ = active.task.await;
+                            let state = build_turn_state(
+                                &config, &device, &asr, &agent, &music, &airplay, &failures,
+                            );
+                            // 服务已经报故障，收尾命令可能没人应答；给 2s 上限，
+                            // 别让「让位」本身卡在一个等不到回复的 oneshot 上。
+                            let _ = timeout(
+                                Duration::from_secs(2),
+                                interrupt_turn(
+                                    &state,
+                                    &speech_handle,
+                                    interrupted,
+                                    InterruptCause::Failure("speech service fatal"),
+                                ),
+                            )
+                            .await;
+                        }
+                        let yielded =
+                            yield_to_native(&device, launcher.as_deref(), "speech.usock fatal")
+                                .await;
+                        std::process::exit(if yielded { 0 } else { 1 });
+                    }
                     SpeechServiceEvent::Turn(turn) if turn.activation().is_wakeup() => {
                         info!(
                             turn_id = turn.id(),
                             interaction_mode = turn.interaction_mode(),
                             "WAKE native mipns"
                         );
-                        let state = TurnState {
-                            config: config.clone(),
-                            device: device.clone(),
-                            asr: asr.clone(),
-                            agent: agent.clone(),
-                            music: music.clone(),
-                            airplay: airplay.clone(),
-                        };
+                        let state = build_turn_state(
+                            &config, &device, &asr, &agent, &music, &airplay, &failures,
+                        );
                         if let Some(active) = active_session.take() {
                             let interrupted = active.turn_id.load(Ordering::Relaxed);
                             if !active.task.is_finished() {
@@ -183,6 +220,19 @@ async fn main() -> anyhow::Result<()> {
                             warn!("turn task ended unexpectedly: {err:?}");
                         }
                     }
+                    let streak = failures.load(Ordering::Relaxed);
+                    if streak >= YIELD_AFTER_CONSECUTIVE_FAILURES {
+                        // 「能唤醒但答不上」已经连续出现整段会话。继续留在接管
+                        // 状态只会让用户一直对着一个不说话的音箱喊，让位更划算。
+                        error!(
+                            consecutive_failures = streak,
+                            "连续多轮会话失败，故障让位给原厂小爱"
+                        );
+                        let yielded =
+                            yield_to_native(&device, launcher.as_deref(), "consecutive failures")
+                                .await;
+                        std::process::exit(if yielded { 0 } else { 1 });
+                    }
                     device
                         .blink_ready(config.device.led_listening, Duration::from_millis(250))
                         .await;
@@ -261,6 +311,102 @@ struct TurnState {
     agent: Arc<AgentRuntime>,
     music: Arc<MusicService>,
     airplay: AirPlayService,
+    /// 连续失败轮数。到阈值就说明「能唤醒但答不上」已经持续了整段会话，
+    /// 与其继续硬撑，不如把麦克风还给原厂小爱。
+    failures: Arc<AtomicU32>,
+}
+
+/// 连续失败到这个数就让位。取 3：一次失败可能是网络抖，连续三次已经完全
+/// 不像「偶发」了，而用户在这期间只会看到灯亮灯灭、听不到一句话。
+const YIELD_AFTER_CONSECUTIVE_FAILURES: u32 = 3;
+
+fn build_turn_state(
+    config: &Arc<AppConfig>,
+    device: &Device,
+    asr: &AsrClient,
+    agent: &Arc<AgentRuntime>,
+    music: &Arc<MusicService>,
+    airplay: &AirPlayService,
+    failures: &Arc<AtomicU32>,
+) -> TurnState {
+    TurnState {
+        config: config.clone(),
+        device: device.clone(),
+        asr: asr.clone(),
+        agent: agent.clone(),
+        music: music.clone(),
+        airplay: airplay.clone(),
+        failures: failures.clone(),
+    }
+}
+
+/// `start-agent.sh` 的位置：优先 `XIAOAI_AGENT_HOME`，否则跟二进制同目录
+/// （launcher 启动的就是 `$AGENT_HOME/xiaoai-agent`）。
+fn launcher_path() -> Option<PathBuf> {
+    if let Ok(home) = std::env::var("XIAOAI_AGENT_HOME") {
+        let candidate = PathBuf::from(home).join("start-agent.sh");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let candidate = exe.parent()?.join("start-agent.sh");
+    candidate.is_file().then_some(candidate)
+}
+
+/// 故障让位：把麦克风还给原厂小爱。
+///
+/// 只做一件事——调 launcher 的 `stop`。它内部按顺序 stop pns、停 watchdog、停
+/// mico、卸掉 speech.usock 保护、还原原生文件，再把原生 mico/pns 起回来
+/// （`start-agent.sh` 的 `restore_native_frontend`）。agent **不**自己拼这套动作：
+/// 顺序错一步音箱就哑，而且那份逻辑已经在脚本里被真机验证过。
+///
+/// 两个必须知道的副作用：
+/// - launcher 会在中途 `kill` 掉本进程，所以这里打的日志是「意图」，结果得看
+///   launcher 日志与 `start-agent.sh status`；正常情况下后面的 `exit` 根本跑不到。
+/// - `stop` 会顺手停掉 watchdog。让位之后音箱停在原厂状态，直到有人再跑
+///   `start-agent.sh start`——这就是这个 issue 想要的结果。
+///
+/// 还有一条别动的细节：本进程被 SIGTERM 打死时不会跑析构，`SpeechService` 的
+/// Drop（它 `remove_file(socket_path)`）因此不会执行。这正是我们要的——脚本
+/// 已经把原生的 `speech.usock` 移回原位，跑析构会把刚还原好的原生 socket 删掉。
+async fn yield_to_native(device: &Device, launcher: Option<&Path>, reason: &str) -> bool {
+    let Some(launcher) = launcher else {
+        error!(
+            reason,
+            "找不到 start-agent.sh，无法让位；只能退出交给 watchdog 处理"
+        );
+        return false;
+    };
+    let script = format!(
+        "{} stop",
+        shell_words::quote(&launcher.display().to_string())
+    );
+    warn!(
+        reason,
+        launcher = %launcher.display(),
+        "故障让位：把麦克风还给原厂小爱"
+    );
+    // 还原序列内部有多次 sleep（stop_pns 最多 5s、stop_mico 最多 10s、
+    // 重启原生服务再等 START_TIMEOUT），给足 180s，别在脚本干到一半时判超时。
+    match device.run_raw(&script, Duration::from_secs(180)).await {
+        Ok(result) if result.exit_code == 0 => {
+            info!("launcher stop 已执行，原厂前端应当已恢复");
+            true
+        }
+        Ok(result) => {
+            error!(
+                exit = result.exit_code,
+                stderr = result.stderr.trim(),
+                "让位命令执行失败"
+            );
+            false
+        }
+        Err(err) => {
+            error!(error = %err, "让位命令没能执行");
+            false
+        }
+    }
 }
 
 async fn reject_orphaned_turn(mut turn: SpeechTurn, speech: &SpeechHandle) {
@@ -295,6 +441,10 @@ async fn run_turn(
             InterruptCause::Failure("turn failed"),
         )
         .await;
+        state.failures.fetch_add(1, Ordering::Relaxed);
+    } else {
+        // 一轮正常结束就清零：偶发失败不该累积成让位。
+        state.failures.store(0, Ordering::Relaxed);
     }
     cleanup_turn_leds(&state.device, &state.config.device).await;
     state.music.restore_after_interruption().await;
@@ -550,4 +700,304 @@ async fn cleanup_turn_leds(device: &Device, led: &DeviceConfig) {
 fn is_capture_timeout(err: &anyhow::Error) -> bool {
     err.to_string()
         .contains("timed out waiting for user speech")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tokio::sync::Mutex;
+
+    use crate::config::AppConfig;
+    use crate::shell::RecordingShell;
+    use crate::speech::{SpeechInput, TestCommand};
+
+    /// 一个完全离线的 `TurnState`，不需要设备也不联网：
+    ///
+    /// - 默认的 `AsrProvider::OpenAi` 让 `start_streaming_transcription` 直接返回
+    ///   `Ok(None)`，于是走本地 VAD 的 `record_utterance`，一次都不发请求；
+    /// - `agent.tools_enabled=false` 让 `AgentRuntime::new` 走
+    ///   `McpConnections::empty()`，不建 MCP 连接；
+    /// - `airplay.enabled=false` 让 `AirPlayService::start` 只构造内存状态。
+    async fn test_state(shell: Arc<RecordingShell>) -> TurnState {
+        let mut config = AppConfig::default();
+        config.agent.tools_enabled = false;
+        config.airplay.enabled = false;
+        // record_utterance 内部会把上限抬到至少 1s，所以超时用例实跑约 1s。
+        config.runtime.session_idle_timeout_s = 1.0;
+        let config = Arc::new(config);
+        let device = Device::with_runner(config.device.clone(), shell);
+        let asr = AsrClient::new(config.asr.clone()).expect("默认 ASR 配置应当可用");
+        let music = Arc::new(
+            MusicService::new(config.clone(), device.clone()).expect("音乐服务构造不应失败"),
+        );
+        let airplay = AirPlayService::start(config.airplay.clone())
+            .await
+            .expect("airplay.enabled=false 时不应失败");
+        let agent = Arc::new(
+            AgentRuntime::new(config.clone(), device.clone(), music.clone())
+                .await
+                .expect("离线构造 agent 不应失败"),
+        );
+        TurnState {
+            config,
+            device,
+            asr,
+            agent,
+            music,
+            airplay,
+            failures: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    async fn commands(recorder: &Arc<Mutex<Vec<TestCommand>>>) -> Vec<TestCommand> {
+        recorder.lock().await.clone()
+    }
+
+    fn followup_channel() -> mpsc::Receiver<SpeechTurn> {
+        let (_tx, rx) = mpsc::channel(2);
+        rx
+    }
+
+    /// 唤醒打断：旧对话必须被 finish 掉，否则 mipns 那侧留着上一轮的对话状态。
+    #[tokio::test]
+    async fn wake_interrupt_finishes_the_old_dialog_and_resets_the_session() {
+        let state = test_state(Arc::new(RecordingShell::always_ok())).await;
+        let (turn, _input_tx, recorder, handle) = SpeechTurn::for_test_with_handle(7);
+
+        interrupt_turn(&state, &handle, turn.id(), InterruptCause::Wake).await;
+
+        assert_eq!(
+            commands(&recorder).await,
+            vec![TestCommand::Finish {
+                continue_dialog: false
+            }],
+            "唤醒打断必须 finish 旧对话"
+        );
+        assert_eq!(state.agent.reset_reason_for_test().await, "wake keyword");
+    }
+
+    /// 空闲超时的收尾不许补发 `stop_capture`：停采集是 capture.rs 的职责，
+    /// 而且它有不对称契约——超时已经补发过一次，`End`/`Cancelled` 则禁止补发。
+    /// 在这一层再补一条会把那个契约踩掉（mipns 侧会收到自己结束后的 stop）。
+    #[tokio::test]
+    async fn idle_timeout_interrupt_never_reissues_stop_capture() {
+        let state = test_state(Arc::new(RecordingShell::always_ok())).await;
+        let (turn, _input_tx, recorder, handle) = SpeechTurn::for_test_with_handle(8);
+
+        interrupt_turn(&state, &handle, turn.id(), InterruptCause::IdleTimeout).await;
+
+        assert_eq!(
+            commands(&recorder).await,
+            vec![TestCommand::Finish {
+                continue_dialog: false
+            }],
+            "中断收尾只发 finish_dialog，不碰 stop_capture"
+        );
+        assert_eq!(
+            state.agent.reset_reason_for_test().await,
+            "session idle timeout"
+        );
+    }
+
+    /// 采集被 mipns 取消：整轮按失败返回，但收尾一步都不能少
+    /// （finish 对话一次、四个 LED 全灭、会话重置）。
+    #[tokio::test]
+    async fn cancelled_stream_fails_the_turn_but_still_cleans_up() {
+        let shell = Arc::new(RecordingShell::always_ok());
+        let state = test_state(shell.clone()).await;
+        let (turn, input_tx, recorder, handle) = SpeechTurn::for_test_with_handle(11);
+        input_tx.send(SpeechInput::Cancelled).await.unwrap();
+        let turn_id = Arc::new(AtomicU64::new(turn.id()));
+
+        let result = run_turn(state.clone(), handle, turn, followup_channel(), turn_id).await;
+
+        assert!(result.is_err(), "mipns 取消流应当让这一轮失败");
+        assert_eq!(
+            commands(&recorder).await,
+            vec![TestCommand::Finish {
+                continue_dialog: false
+            }],
+            "失败路径只 finish 一次：run_session 里的采集错误不再各自补一条"
+        );
+        assert_eq!(
+            shell.count_matching("/bin/shut_led"),
+            4,
+            "四个 LED 必须全灭，否则会留一盏常亮灯"
+        );
+        assert_eq!(state.agent.reset_reason_for_test().await, "turn failed");
+        assert_eq!(
+            state.failures.load(Ordering::Relaxed),
+            1,
+            "失败轮数要累计：连续 3 轮才让位"
+        );
+    }
+
+    /// 会话空闲超时是**正常结束**：先由 capture.rs 补发 stop_capture，
+    /// 再由收尾发 finish_dialog，顺序不能反（反了 mipns 的 stream 会挂着）。
+    #[tokio::test]
+    async fn idle_timeout_ends_the_session_without_a_failure() {
+        let shell = Arc::new(RecordingShell::always_ok());
+        let state = test_state(shell).await;
+        let (turn, _input_tx, recorder, handle) = SpeechTurn::for_test_with_handle(12);
+        let turn_id = Arc::new(AtomicU64::new(turn.id()));
+
+        let result = run_turn(state.clone(), handle, turn, followup_channel(), turn_id).await;
+
+        assert!(result.is_ok(), "空闲超时不是失败: {result:?}");
+        assert_eq!(
+            commands(&recorder).await,
+            vec![
+                TestCommand::StopCapture,
+                TestCommand::Finish {
+                    continue_dialog: false
+                }
+            ],
+            "先 stop_capture（capture.rs）再 finish_dialog（收尾）"
+        );
+        assert_eq!(
+            state.agent.reset_reason_for_test().await,
+            "session idle timeout"
+        );
+        assert_eq!(
+            state.failures.load(Ordering::Relaxed),
+            0,
+            "正常结束要清零，否则偶发失败会累积成让位"
+        );
+    }
+
+    #[tokio::test]
+    async fn followup_request_command_goes_through_the_seam_and_succeeds() {
+        let shell = Arc::new(RecordingShell::answering(r#"{"code":0}"#));
+        let device = Device::with_runner(DeviceConfig::default(), shell.clone());
+
+        request_followup_capture(&device).await.unwrap();
+
+        let script = shell.last_script().expect("必须真的调 pnshelper");
+        assert!(script.contains("pnshelper event_notify"), "{script}");
+        assert!(script.contains(r#"{"src":1,"event":0}"#), "{script}");
+    }
+
+    #[tokio::test]
+    async fn followup_request_surfaces_command_failures() {
+        let shell = Arc::new(RecordingShell::exiting_with(2, "ubus: not found"));
+        let device = Device::with_runner(DeviceConfig::default(), shell);
+        let err = request_followup_capture(&device)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exit=2"), "{err}");
+        assert!(err.contains("ubus: not found"), "{err}");
+
+        let shell = Arc::new(RecordingShell::cannot_run(
+            "shell command timed out after 10s: ubus",
+        ));
+        let device = Device::with_runner(DeviceConfig::default(), shell);
+        let err = request_followup_capture(&device)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to request follow-up capture"), "{err}");
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn followup_request_rejects_bad_pnshelper_answers() {
+        let device = Device::with_runner(
+            DeviceConfig::default(),
+            Arc::new(RecordingShell::answering("not json")),
+        );
+        let err = request_followup_capture(&device)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid follow-up response"), "{err}");
+
+        let device = Device::with_runner(
+            DeviceConfig::default(),
+            Arc::new(RecordingShell::answering(r#"{"code":7}"#)),
+        );
+        let err = request_followup_capture(&device)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rejected follow-up capture"), "{err}");
+    }
+
+    /// 只认采集空闲超时。ASR 转写超时同样是 "timed out"，但那是服务故障，
+    /// 不能当成空闲超时静默结束（否则用户说完话只会看到灯灭）。
+    #[test]
+    fn is_capture_timeout_matches_only_the_idle_timeout_error() {
+        assert!(is_capture_timeout(&anyhow::anyhow!(
+            "timed out waiting for user speech"
+        )));
+        assert!(!is_capture_timeout(&anyhow::anyhow!(
+            "timed out waiting for Realtime ASR transcript"
+        )));
+        assert!(!is_capture_timeout(&anyhow::anyhow!(
+            "mipns cancelled the speech stream"
+        )));
+    }
+
+    /// 没有活跃会话却收到 turn：顺序必须是「先停采集，再挂断」。
+    #[tokio::test]
+    async fn orphaned_turn_stops_capture_before_finishing_the_dialog() {
+        let (turn, _input_tx, recorder, handle) = SpeechTurn::for_test_with_handle(21);
+
+        reject_orphaned_turn(turn, &handle).await;
+
+        assert_eq!(
+            commands(&recorder).await,
+            vec![
+                TestCommand::StopCapture,
+                TestCommand::Finish {
+                    continue_dialog: false
+                }
+            ],
+            "顺序不能反：先停采集再挂断，否则 mipns 的 stream 一直挂着"
+        );
+    }
+
+    /// 让位只有一个动作：调 launcher 的 `stop`。还原顺序（停 pns → 停 watchdog
+    /// → 停 mico → 卸保护 → 还原文件 → 起原生服务）全在脚本里，别在 agent 里重写。
+    #[tokio::test]
+    async fn yield_to_native_asks_the_launcher_to_stop() {
+        let shell = Arc::new(RecordingShell::always_ok());
+        let device = Device::with_runner(DeviceConfig::default(), shell.clone());
+        let launcher = Path::new("/data/open-xiaoai/start-agent.sh");
+
+        assert!(yield_to_native(&device, Some(launcher), "fatal").await);
+
+        assert_eq!(shell.command_count(), 1, "让位就一条命令");
+        let script = shell.last_script().expect("必须调 launcher");
+        assert!(
+            script.ends_with("start-agent.sh stop"),
+            "必须是 launcher 的 stop（restore_native_frontend 在它里面）: {script}"
+        );
+    }
+
+    /// launcher 用 `mkdir` 锁和 watchdog 互斥：watchdog 正在 restart 时我们的
+    /// stop 会撞锁失败。这种情况必须如实返回 false（调用方据此定退出码），
+    /// 不能假装让位成功。
+    #[tokio::test]
+    async fn yield_to_native_reports_failure_instead_of_pretending() {
+        let shell = Arc::new(RecordingShell::exiting_with(
+            1,
+            "another launcher operation is in progress",
+        ));
+        let device = Device::with_runner(DeviceConfig::default(), shell);
+        let launcher = Path::new("/data/open-xiaoai/start-agent.sh");
+
+        assert!(!yield_to_native(&device, Some(launcher), "fatal").await);
+    }
+
+    #[tokio::test]
+    async fn yield_to_native_without_a_launcher_runs_nothing() {
+        let shell = Arc::new(RecordingShell::always_ok());
+        let device = Device::with_runner(DeviceConfig::default(), shell.clone());
+
+        assert!(!yield_to_native(&device, None, "fatal").await);
+
+        assert_eq!(shell.command_count(), 0, "找不到 launcher 就别瞎跑命令");
+    }
 }
