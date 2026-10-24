@@ -98,10 +98,12 @@ Rules:
   `4`/`5`/timeout all exit. A missing or non-executable launcher never reaches `3`
   (it becomes `exit_code: None` or `126`, both of which exit) — the docs must not
   read more optimistically than the code.
-  `5` is checked **before** `succeeded()`: its last two steps (`start_native_mico`,
-  `pns start`) run after `rm` + `mv`, so the inode already points at the native
-  socket while mico/pns are down — socket in place, microphone dead. When the
-  script and the inode disagree, the script knows more.
+  `5` is folded into `succeeded()` itself, not into one call site: its last two
+  steps (`start_native_mico`, `pns start`) run after `rm` + `mv`, so the inode
+  already points at the native socket while mico/pns are down — socket in place,
+  microphone dead. When the script and the inode disagree, the script knows more.
+  `succeeded()` has three call sites (`Fatal` ×2, consecutive failures ×1); a rule
+  written at one of them leaves the more common `Fatal` path unguarded.
   Changing one side without the other silently turns "untouched" into "half
   dismantled" — that pairing is why the codes live in `start-agent.sh` with a
   pointer to `YieldOutcome` in `main.rs`.
@@ -124,6 +126,21 @@ Rules:
   escalates to `SpeechServiceEvent::Fatal`. Grading those errors (warn and
   continue for recoverable `errno`s, fatal only for an unusable socket) needs
   its own bounded-retry design and is not implemented yet.
+
+## Testing Rules
+
+- **A fix for a hole needs a test that fails without the fix.** Prove it by
+  reverting the fix, watching the new test go red with the *expected* wrong value,
+  then restoring. "Green CI" cannot tell a test that guards something from a test
+  that merely runs; only the reverse check can. The cross-file contracts in this
+  repo (yield exit codes, `ServiceState` survival across restarts, config section
+  rollback, `/health` socket ownership) were each caught or confirmed this way.
+  **Assert that the reverting edit actually applied** (count the match before
+  writing): a `replace` that silently matches nothing yields a false green and
+  you will report "verified" for a check that never ran.
+- Prefer real filesystem facts over flags that stand in for them: `rm` + `rename`
+  for an inode change, a real `UnixDatagram` for a socket error, a real file for a
+  path that must exist.
 
 ## Configuration Hot Reload
 

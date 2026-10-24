@@ -43,6 +43,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 部署脚本不走 rustc：语法错误只有上机才发现（CRLF 那次就是这样）。
+      # bash -n 零成本，能在 CI 里挡掉整类问题。
+      - name: Shell syntax check
+        run: |
+          bash -n xiaoai-agent/start-agent.sh
+          bash -n deploy/client-patch/src/build.sh
+          bash -n deploy/client-patch/src/extract.sh
+
       - name: Install Rust
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal

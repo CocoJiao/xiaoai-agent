@@ -524,17 +524,6 @@ async fn yield_after_consecutive_failures(
     failures: &Arc<AtomicU32>,
 ) -> Option<i32> {
     let outcome = yield_to_native(device, launcher, ownership, "consecutive failures").await;
-    // 先看脚本有没有明确说「拆到一半」：exit 5 的后两格（mico/pns 起不来）发生在
-    // `rm -f` + `mv` **之后**，inode 已经换回原生的了，`succeeded()` 会命中
-    // `taken_over == true` 而直接判成功。可那种状态是「socket 就位、原生服务没跑、
-    // watchdog 已停」——正是本 PR 想消灭的「看起来一切正常」。脚本比 inode 知道得多，
-    // 所以这一档必须以脚本为准。
-    if outcome.exit_code == Some(LAUNCHER_EXIT_HALF_DISMANTLED) {
-        error!(
-            "让位命令报告原生服务未起来（exit=5）：inode 已换回原生，但 mico/pns 不可用，判失败退出"
-        );
-        return Some(1);
-    }
     if outcome.succeeded() {
         return Some(0);
     }
@@ -558,10 +547,16 @@ async fn yield_after_consecutive_failures(
         failures.store(0, Ordering::Relaxed);
         return None;
     }
-    error!(
-        exit = ?outcome.exit_code,
-        "让位失败且前端可能已被拆开：判失败退出，避免「看起来一切正常但麦克风不工作」"
-    );
+    if outcome.exit_code == Some(LAUNCHER_EXIT_HALF_DISMANTLED) {
+        error!(
+            "让位命令报告原生服务未起来（exit=5）：inode 已换回原生，但 mico/pns 不可用，判失败退出"
+        );
+    } else {
+        error!(
+            exit = ?outcome.exit_code,
+            "让位失败且前端可能已被拆开：判失败退出，避免「看起来一切正常但麦克风不工作」"
+        );
+    }
     Some(1)
 }
 
@@ -715,7 +710,19 @@ struct YieldOutcome {
 
 impl YieldOutcome {
     /// 让位是否达成：命令成功，或者事实上已经被接管走。
+    ///
+    /// 但 `exit 5`（脚本自述「原生服务没起来」）**压过 inode 事实**：那两格
+    /// （`start_native_mico` / `pns start`）发生在 `rm` + `mv` **之后**，inode 已经
+    /// 换回原生的了，但 mico/pns 没跑——socket 在位、麦克风不工作。脚本比 inode
+    /// 知道得多，所以这一档以脚本为准。
+    ///
+    /// 这条规则必须放在这里而不是某个调用点：`succeeded()` 有三个调用点
+    /// （`Fatal` ×2、连续失败 ×1），规则写在外面就要求三处各自解释一遍，
+    /// 而漏掉的那处恰好是更常走的 `Fatal` 路径。
     fn succeeded(&self) -> bool {
+        if self.exit_code == Some(LAUNCHER_EXIT_HALF_DISMANTLED) {
+            return false;
+        }
         self.issued || self.taken_over
     }
 }
@@ -1572,6 +1579,26 @@ mod tests {
             "inode 换了但原生服务没起来，不能算成功（退出码 0 = 哑且无任何信号）"
         );
         let _ = std::fs::remove_file(taken.path());
+    }
+
+    /// `succeeded()` 是「让位是否达成」的唯一答案：`exit 5` 必须压过 inode 事实。
+    /// 三个调用点（Fatal ×2、连续失败 ×1）共用这一条，钉住它就等于三处都钉住。
+    #[test]
+    fn exit_code_5_is_never_success_even_with_a_replaced_inode() {
+        let half = YieldOutcome {
+            issued: false,
+            taken_over: true,
+            timed_out: false,
+            exit_code: Some(LAUNCHER_EXIT_HALF_DISMANTLED),
+        };
+        assert!(!half.succeeded(), "inode 换了但原生服务没起来，不能算成功");
+
+        // 对照：同一个「inode 已换」的事实，脚本说成功时才算成功。
+        let restored = YieldOutcome {
+            exit_code: Some(0),
+            ..half
+        };
+        assert!(restored.succeeded());
     }
 
     /// 让位**超时**不能算「脚本没动前端」：脚本可能正停在还原中途，此时
