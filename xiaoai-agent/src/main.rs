@@ -681,6 +681,11 @@ async fn yield_to_native(
     };
 
     let taken_over = ownership.taken_over();
+    // 注意：超时（`run_detached` 返回 Err）时脚本其实还在跑，这里是紧接着做的
+    // 一次瞬间快照，可能正好落在 restore_native_files 的 `rm -f` 与 `mv` 之间——
+    // 那种情况下 `taken_over()` 为 false（严格化后不再把「路径不存在」当接管），
+    // 于是判失败、退出码 1。方向上是刻意的：误报失败只是多查一次，误报成功会把
+    // 唯一的信号消灭掉。真机上若见到「明明恢复了却退出 1」，先看这里。
     // 两种矛盾态都要留痕：它们正是「命令说的」和「事实」对不上的地方，
     // 而 `succeeded()` 会把它们合成一个结论——不记录就再也看不见了。
     if taken_over && !issued {

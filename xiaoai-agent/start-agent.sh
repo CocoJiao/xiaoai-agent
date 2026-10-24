@@ -262,6 +262,11 @@ restore_native_files() {
         umount "$PNS_INIT" || return 1
     fi
     if [ -e "$NATIVE_SPEECH_SOCKET" ]; then
+        # 这里必须让路径上的 inode 真的换掉：agent 侧（speech.rs 的
+        # SocketOwnership）用「inode 变了」判断让位是否成功。改成
+        # cp -f "$NATIVE_SPEECH_SOCKET" "$SPEECH_SOCKET" 看起来等价甚至"更原子"，
+        # 但 cp 对已存在的目标文件是 O_TRUNC 写内容，inode 不变 —— 于是每一次
+        # 让位都会被判成「麦克风没交出去」，退出码恒为 1。别合并这两行。
         rm -f "$SPEECH_SOCKET"
         mv "$NATIVE_SPEECH_SOCKET" "$SPEECH_SOCKET" || return 1
     fi
