@@ -51,6 +51,10 @@ pub fn definition(
 /// 校验单个工具定义的参数 schema 是否满足上面的约定。
 ///
 /// 返回错误信息而不是直接 panic，便于测试里带上工具名。
+///
+/// 已知边界：这套 schema **还不满足 OpenAI strict mode** —— 那边要求
+/// `additionalProperties: false` 且所有属性都必须进 `required`。现在没有接
+/// strict 端点是对的（多数中转不支持那两个约束），以后要接需在这里补校验。
 pub fn validate_definition(def: &ToolDefinition) -> Result<(), String> {
     let params = &def.parameters;
     if params.get("type").and_then(Value::as_str) != Some("object") {
@@ -70,7 +74,10 @@ pub fn validate_definition(def: &ToolDefinition) -> Result<(), String> {
             .as_str()
             .ok_or_else(|| format!("{}: required 里出现非字符串项", def.name))?;
         if !properties.contains_key(key) {
-            return Err(format!("{}: required 里的 {key} 不在 properties 中", def.name));
+            return Err(format!(
+                "{}: required 里的 {key} 不在 properties 中",
+                def.name
+            ));
         }
     }
     for (prop, schema) in properties {
@@ -171,6 +178,9 @@ impl Tool for GetWeather {
         definition(
             Self::NAME,
             "查询天气预报。location 可传 QWeather location，例如 114.1,30.52；留空按当前 IP 定位。",
+            // 可选参数靠「不列进 required」表达，不要写 ["string","null"]：
+            // 严格后端会拒绝数组式 type。Rust 侧是 Option<String>，模型显式
+            // 发 null 时 serde 仍会映射成 None，所以这里写单一类型是安全的。
             json!({"location": {"type": "string"}}),
             &[],
         )
@@ -624,7 +634,9 @@ mod tests {
 
     /// 用示例配置构造，避免依赖真实 agent.yaml（可能含密钥）。
     fn example_config() -> Arc<AppConfig> {
-        Arc::new(serde_yaml::from_str(include_str!("../agent.example.yaml")).expect("示例配置应可解析"))
+        Arc::new(
+            serde_yaml::from_str(include_str!("../agent.example.yaml")).expect("示例配置应可解析"),
+        )
     }
 
     /// 把 agent.rs 里注册的全部工具定义收集起来，供下面三条断言共用。
@@ -687,9 +699,7 @@ mod tests {
             PlayPreviousMusic::new(music.clone())
                 .definition(String::new())
                 .await,
-            GetMusicStatus::new(music)
-                .definition(String::new())
-                .await,
+            GetMusicStatus::new(music).definition(String::new()).await,
         ]
     }
 
@@ -711,7 +721,11 @@ mod tests {
     #[tokio::test]
     async fn every_tool_definition_is_strict_backend_compatible() {
         let defs = all_definitions().await;
-        assert_eq!(defs.len(), 17, "工具数量变了，请同步 AgentRuntime 的注册列表");
+        assert_eq!(
+            defs.len(),
+            17,
+            "工具数量变了，请同步 AgentRuntime 的注册列表"
+        );
         for def in &defs {
             validate_definition(def).unwrap_or_else(|err| panic!("{err}"));
         }
@@ -722,10 +736,7 @@ mod tests {
         let defs = all_definitions().await;
         assert_eq!(required_of(&defs, "web_search"), vec!["query"]);
         assert_eq!(required_of(&defs, "search_music_library"), vec!["query"]);
-        assert_eq!(
-            required_of(&defs, "submit_music_login_code"),
-            vec!["code"]
-        );
+        assert_eq!(required_of(&defs, "submit_music_login_code"), vec!["code"]);
         // 下面这些工具有可选参数或无参数：required 必须是空数组，不能缺字段。
         for name in [
             "get_current_time",

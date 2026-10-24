@@ -97,6 +97,8 @@ impl AgentRuntime {
         let control = Arc::new(Mutex::new(AgentControl::default()));
         let mut tool_server = ToolServer::new();
         if config.agent.tools_enabled {
+            // 新增/删除工具时，必须同步 tools.rs 测试里的 all_definitions()：
+            // 那边是按这份列表手工抄的，数量断言靠它兜住。
             tool_server = tool_server
                 .tool(GetCurrentTime::new(config.clone()))
                 .tool(GetWeather::new(config.clone()))
