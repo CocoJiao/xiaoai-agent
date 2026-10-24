@@ -1,6 +1,7 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, bail, Context};
 use rand::RngCore;
@@ -384,7 +385,18 @@ async fn handle_upward(
                             debug!(id = stream.id, "speech stream consumer closed");
                         }
                         Err(TrySendError::Full(_)) => {
-                            bail!("speech audio queue overflow on turn {}", stream.id);
+                            // 丢一帧音频，绝不把"队列满"升级成进程退出：
+                            // 消费端短暂卡顿会让整机重启，用户表现为"说着话突然没反应"。
+                            // 限流：卡顿时一秒可能丢几十帧，不限流会把日志（ramdisk）刷满。
+                            static LAST_WARN: AtomicU64 = AtomicU64::new(0);
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            if now.saturating_sub(LAST_WARN.load(Ordering::Relaxed)) >= 5 {
+                                LAST_WARN.store(now, Ordering::Relaxed);
+                                warn!(id = stream.id, "speech audio queue full, dropping frames");
+                            }
                         }
                     }
                 }

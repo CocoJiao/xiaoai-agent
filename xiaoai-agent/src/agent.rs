@@ -48,6 +48,25 @@ pub const SPEAKER_AGENT_INSTRUCTIONS: &str = concat!(
     "如果工具返回错误或信息不足，要坦率说明无法确认。"
 );
 
+/// 关闭工具时使用的 preamble。
+/// 原来的 preamble 会命令模型"必须调用工具"，而 tools_enabled=false 时那些工具
+/// 根本不存在，模型会谎称"正在为你播放"或直接说"我无法查询"，体验更差。
+pub const SPEAKER_AGENT_INSTRUCTIONS_NO_TOOLS: &str = concat!(
+    "你是小爱同学，一个运行在小爱音箱上的中文语音助手。",
+    "你运行在小爱音箱端侧；端侧程序负责语音唤醒、云端 ASR、TTS 和播放控制。",
+    "你负责根据用户文本请求完成任务并返回适合朗读的文本。",
+    "直接给最终答案，不要输出思考过程。",
+    "回答要自然、简短、适合直接朗读。",
+    "通常只说一到两句话，除非用户明确要求详细解释。",
+    "不要使用 Markdown，不要列太长的清单。",
+    "【重要】当前没有任何工具可用：你无法播放音乐、无法控制智能家居、无法联网搜索、无法查询实时数据。",
+    "遇到这类请求，直接简短说明你现在做不到；不要提『管理员』『工具开关』之类内部概念；",
+    "绝对不要声称你已经执行了某个动作。",
+    "用户消息开头会给出当前时间；用户问时间或日期时直接使用它。",
+    "对于天气、新闻、股价等需要实时数据的请求，说明你拿不到实时数据。",
+    "如果用户表达再见、拜拜、不用了、先这样等结束意图，直接用一句简短告别回复。"
+);
+
 #[derive(Debug, Clone)]
 pub struct AgentTurnResult {
     pub text: String,
@@ -76,27 +95,36 @@ impl AgentRuntime {
         music: Arc<MusicService>,
     ) -> anyhow::Result<Self> {
         let control = Arc::new(Mutex::new(AgentControl::default()));
-        let tool_server = ToolServer::new()
-            .tool(GetCurrentTime::new(config.clone()))
-            .tool(GetWeather::new(config.clone()))
-            .tool(WebSearch::new(config.clone()))
-            .tool(EndConversation::new(control.clone()))
-            .tool(SearchMusic::new(music.clone()))
-            .tool(RequestMusicLoginCode::new(music.clone()))
-            .tool(SubmitMusicLoginCode::new(music.clone()))
-            .tool(PlayMusicQuery::new(music.clone()))
-            .tool(AddMusicToQueue::new(music.clone()))
-            .tool(AddRandomMusicToQueue::new(music.clone()))
-            .tool(PlayRandomMusic::new(music.clone()))
-            .tool(StopMusicPlayback::new(music.clone()))
-            .tool(PauseMusicPlayback::new(music.clone()))
-            .tool(ResumeMusicPlayback::new(music.clone()))
-            .tool(PlayNextMusic::new(music.clone()))
-            .tool(PlayPreviousMusic::new(music.clone()))
-            .tool(GetMusicStatus::new(music))
-            .run();
+        let mut tool_server = ToolServer::new();
+        if config.agent.tools_enabled {
+            tool_server = tool_server
+                .tool(GetCurrentTime::new(config.clone()))
+                .tool(GetWeather::new(config.clone()))
+                .tool(WebSearch::new(config.clone()))
+                .tool(EndConversation::new(control.clone()))
+                .tool(SearchMusic::new(music.clone()))
+                .tool(RequestMusicLoginCode::new(music.clone()))
+                .tool(SubmitMusicLoginCode::new(music.clone()))
+                .tool(PlayMusicQuery::new(music.clone()))
+                .tool(AddMusicToQueue::new(music.clone()))
+                .tool(AddRandomMusicToQueue::new(music.clone()))
+                .tool(PlayRandomMusic::new(music.clone()))
+                .tool(StopMusicPlayback::new(music.clone()))
+                .tool(PauseMusicPlayback::new(music.clone()))
+                .tool(ResumeMusicPlayback::new(music.clone()))
+                .tool(PlayNextMusic::new(music.clone()))
+                .tool(PlayPreviousMusic::new(music.clone()))
+                .tool(GetMusicStatus::new(music));
+        } else {
+            let _ = &music; // 未启用工具时保持变量被使用
+        }
+        let tool_server = tool_server.run();
 
-        let mcp = McpConnections::connect(config.clone(), tool_server.clone()).await;
+        let mcp = if config.agent.tools_enabled {
+            McpConnections::connect(config.clone(), tool_server.clone()).await
+        } else {
+            McpConnections::empty()
+        };
         if let Err(err) = device.stop_audio().await {
             warn!("initial stop_audio failed, continuing: {err:?}");
         }
@@ -123,7 +151,17 @@ impl AgentRuntime {
             control.end_reason.clear();
         }
 
-        let prompt = self.prompt_with_history(message).await;
+        // 关闭工具时（例如后端代理不支持 tools API），模型拿不到当前时间，
+        // 问"现在几点"会答"不方便查询"。默认只在没有工具时注入；
+        // inject_current_time=true 可强制注入（工具存在时也能省一次工具调用）。
+        let inject_time = self.config.agent.inject_current_time || !self.config.agent.tools_enabled;
+        let message_with_time = if inject_time {
+            format!("{}{}", self.now_prefix(), message)
+        } else {
+            message.to_string()
+        };
+
+        let prompt = self.prompt_with_history(&message_with_time).await;
         let text = self.prompt_once(prompt).await?;
 
         let control = self.control.lock().await;
@@ -133,6 +171,41 @@ impl AgentRuntime {
             should_end: control.should_end,
             end_reason: control.end_reason.clone(),
         })
+    }
+
+    /// 按是否注册工具选择 preamble，避免"命令模型调用不存在的工具"。
+    fn preamble(&self) -> &'static str {
+        if self.config.agent.tools_enabled {
+            SPEAKER_AGENT_INSTRUCTIONS
+        } else {
+            SPEAKER_AGENT_INSTRUCTIONS_NO_TOOLS
+        }
+    }
+
+    /// 把当前时间写进用户消息，供关闭工具时的模型使用。
+    fn now_prefix(&self) -> String {
+        use chrono::Utc;
+        let tz: chrono_tz::Tz = self
+            .config
+            .agent
+            .timezone
+            .parse()
+            .unwrap_or(chrono_tz::Asia::Shanghai);
+        let now = Utc::now().with_timezone(&tz);
+        let weekday = match now.format("%u").to_string().as_str() {
+            "1" => "一",
+            "2" => "二",
+            "3" => "三",
+            "4" => "四",
+            "5" => "五",
+            "6" => "六",
+            _ => "日",
+        };
+        format!(
+            "【当前时间：{} 星期{}】\n",
+            now.format("%Y年%m月%d日 %H:%M"),
+            weekday
+        )
     }
 
     async fn prompt_once(&self, prompt: String) -> anyhow::Result<String> {
@@ -162,7 +235,7 @@ impl AgentRuntime {
 
         let agent = client
             .agent(self.config.llm.model.as_str())
-            .preamble(SPEAKER_AGENT_INSTRUCTIONS)
+            .preamble(self.preamble())
             .temperature(self.config.llm.temperature)
             .max_tokens(self.config.llm.max_tokens)
             .default_max_turns(3)
@@ -178,13 +251,34 @@ impl AgentRuntime {
         http_client: reqwest::Client,
         prompt: String,
     ) -> anyhow::Result<String> {
+        // 老版 Claude 要求 1024 <= budget_tokens < max_tokens；默认配置是
+        // budget 1024 / max_tokens 300，直接开 thinking 会每轮失败并播"大模型服务遇到问题"。
+        // 这里改成自动收敛并告警，不让纯配置陷阱把音箱弄哑。
+        let mut thinking_params = anthropic_thinking_params(
+            &self.config.llm.thinking.mode,
+            self.config.llm.thinking.budget_tokens,
+        );
         if self.config.llm.thinking.mode == LlmThinkingMode::Enabled {
-            anyhow::ensure!(
-                self.config.llm.thinking.budget_tokens < self.config.llm.max_tokens,
-                "llm.thinking.budget_tokens ({}) must be lower than llm.max_tokens ({})",
-                self.config.llm.thinking.budget_tokens,
-                self.config.llm.max_tokens
-            );
+            const MIN_BUDGET: u64 = 1024;
+            let max = self.config.llm.max_tokens;
+            let wanted = self.config.llm.thinking.budget_tokens;
+            if wanted < MIN_BUDGET || wanted >= max {
+                // 合法区间是 [1024, max_tokens)。区间为空说明 max_tokens 太小，
+                // 静默给一个非法值只会换来 400，这里直接报出人话错误。
+                anyhow::ensure!(
+                    max > MIN_BUDGET,
+                    "llm.thinking.mode=enabled 需要 llm.thinking.budget_tokens 落在                      [1024, llm.max_tokens) 区间，但 llm.max_tokens={max} 太小；                     请把 llm.max_tokens 调到 2048 以上（或把 thinking.mode 设回 auto）"
+                );
+                let clamped = wanted.clamp(MIN_BUDGET, max - 1);
+                warn!(
+                    wanted,
+                    max_tokens = max,
+                    clamped,
+                    "llm.thinking.budget_tokens out of range, clamped into [1024, max_tokens)"
+                );
+                thinking_params =
+                    anthropic_thinking_params(&LlmThinkingMode::Enabled, clamped);
+            }
         }
 
         let client = anthropic::Client::builder()
@@ -197,13 +291,10 @@ impl AgentRuntime {
 
         let mut builder = client
             .agent(self.config.llm.model.as_str())
-            .preamble(SPEAKER_AGENT_INSTRUCTIONS)
+            .preamble(self.preamble())
             .max_tokens(self.config.llm.max_tokens)
             .default_max_turns(3)
-            .additional_params(anthropic_thinking_params(
-                &self.config.llm.thinking.mode,
-                self.config.llm.thinking.budget_tokens,
-            ));
+            .additional_params(thinking_params);
         if self.config.llm.thinking.mode != LlmThinkingMode::Enabled {
             builder = builder.temperature(self.config.llm.temperature);
         }
@@ -245,23 +336,19 @@ impl AgentRuntime {
 
 fn openai_thinking_params(mode: &LlmThinkingMode) -> Value {
     match mode {
-        LlmThinkingMode::Auto => json!({}),
-        LlmThinkingMode::Disabled => json!({
-            "reasoning_effort": "low",
-            "enable_thinking": false,
-            "chat_template_kwargs": {"enable_thinking": false}
-        }),
-        LlmThinkingMode::Enabled => json!({
-            "enable_thinking": true,
-            "chat_template_kwargs": {"enable_thinking": true}
-        }),
+        // Auto / Disabled 都不发参数：reasoning_effort、enable_thinking、
+        // chat_template_kwargs 都是特定厂商（OpenAI 推理模型 / Qwen 系）的方言，
+        // 换成严格代理或其它模型时会被 400 拒绝。确实需要时再按目标模型单独加回。
+        LlmThinkingMode::Auto | LlmThinkingMode::Disabled => json!({}),
+        LlmThinkingMode::Enabled => json!({ "enable_thinking": true }),
     }
 }
 
 fn anthropic_thinking_params(mode: &LlmThinkingMode, budget_tokens: u64) -> Value {
     match mode {
-        LlmThinkingMode::Auto => json!({}),
-        LlmThinkingMode::Disabled => json!({"thinking": {"type": "disabled"}}),
+        // 新版 Claude 已移除 budget_tokens，连 {"type":"disabled"} 都会 400；
+        // 默认什么都不发，代际通吃。
+        LlmThinkingMode::Auto | LlmThinkingMode::Disabled => json!({}),
         LlmThinkingMode::Enabled => {
             json!({"thinking": {"type": "enabled", "budget_tokens": budget_tokens}})
         }
@@ -276,9 +363,14 @@ mod tests {
 
     #[test]
     fn disables_thinking_for_anthropic_messages() {
+        // 默认不发任何 thinking 参数：新版 Claude 连 {"type":"disabled"} 都会 400
         assert_eq!(
             anthropic_thinking_params(&LlmThinkingMode::Disabled, 1024),
-            json!({"thinking": {"type": "disabled"}})
+            json!({})
+        );
+        assert_eq!(
+            anthropic_thinking_params(&LlmThinkingMode::Auto, 1024),
+            json!({})
         );
     }
 
@@ -291,9 +383,16 @@ mod tests {
     }
 
     #[test]
-    fn disables_thinking_for_openai_chat() {
-        let params = openai_thinking_params(&LlmThinkingMode::Disabled);
-        assert_eq!(params["enable_thinking"], false);
-        assert_eq!(params["chat_template_kwargs"]["enable_thinking"], false);
+    fn omits_vendor_specific_params_by_default() {
+        // reasoning_effort / chat_template_kwargs 是厂商方言，默认不能发
+        assert_eq!(
+            openai_thinking_params(&LlmThinkingMode::Disabled),
+            json!({})
+        );
+        assert_eq!(openai_thinking_params(&LlmThinkingMode::Auto), json!({}));
+        assert_eq!(
+            openai_thinking_params(&LlmThinkingMode::Enabled),
+            json!({"enable_thinking": true})
+        );
     }
 }

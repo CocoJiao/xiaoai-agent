@@ -429,6 +429,7 @@ async fn request_followup_capture() -> anyhow::Result<()> {
     sleep(Duration::from_millis(100)).await;
     let result = crate::shell::run_shell(
         r#"ubus -t 1 -S call pnshelper event_notify '{"src":1,"event":0}'"#,
+        Duration::from_secs(10),
     )
     .await
     .map_err(|err| anyhow::anyhow!("failed to request follow-up capture: {err}"))?;

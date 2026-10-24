@@ -95,7 +95,8 @@ impl Device {
     }
 
     async fn run_script(&self, script: &str) -> anyhow::Result<()> {
-        let result = run_shell(script)
+        let limit = std::time::Duration::from_secs_f64(self.config.command_timeout_s.max(1.0));
+        let result = run_shell(script, limit)
             .await
             .map_err(|err| anyhow::anyhow!("{err}"))?;
         if result.exit_code != 0 {

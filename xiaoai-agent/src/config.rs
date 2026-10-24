@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use crate::shell::DEFAULT_COMMAND_TIMEOUT;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -67,6 +68,9 @@ impl Default for RuntimeConfig {
 #[serde(default)]
 pub struct DeviceConfig {
     pub tts_command: String,
+    /// 单条设备命令（tts_play.sh / miplayer / ubus 等）的最长执行时间。
+    /// 同步播放的长回复可能接近这个上限，按需调大。
+    pub command_timeout_s: f64,
     pub play_url_command: String,
     pub stop_audio_command: String,
     pub pause_audio_command: String,
@@ -85,6 +89,7 @@ impl Default for DeviceConfig {
     fn default() -> Self {
         Self {
             tts_command: "/usr/sbin/tts_play.sh --notify-pns {text}".to_string(),
+            command_timeout_s: DEFAULT_COMMAND_TIMEOUT.as_secs_f64(),
             play_url_command:
                 "killall miplayer 2>/dev/null; miplayer -f {url} >/tmp/xiaoai-miplayer.log 2>&1 &"
                     .to_string(),
@@ -314,6 +319,13 @@ pub struct AgentConfig {
     pub timezone: String,
     pub weather: WeatherConfig,
     pub web_search: WebSearchConfig,
+    /// 是否把当前时间注入用户消息（关闭工具时，模型仍能回答时间/日期类问题）。
+    pub inject_current_time: bool,
+    /// 是否向 LLM 注册工具（内置 + MCP）。
+    /// 某些 OpenAI 兼容代理会丢弃 tool_calls 内容，表现为
+    /// "Response contained no message or tool call (empty)"；
+    /// 这类端点必须关掉工具才能正常对话。
+    pub tools_enabled: bool,
 }
 
 impl Default for AgentConfig {
@@ -322,6 +334,8 @@ impl Default for AgentConfig {
             timezone: "Asia/Shanghai".to_string(),
             weather: WeatherConfig::default(),
             web_search: WebSearchConfig::default(),
+            inject_current_time: false,
+            tools_enabled: true,
         }
     }
 }
@@ -574,9 +588,19 @@ impl Default for NavidromeConfig {
     }
 }
 
+/// URL 是否已带路径段（`https://host` 为 false，`https://host/api/v3` 为 true）。
+fn url_has_path(base: &str) -> bool {
+    base.split_once("://")
+        .map(|(_, rest)| rest.contains('/'))
+        .unwrap_or(false)
+}
+
 pub fn openai_base_url(raw: &str) -> String {
     let base = raw.trim_end_matches('/');
-    if base.ends_with("/v1") {
+    // 只有在 URL 没有路径段时才补 /v1。
+    // 例如 https://ark.cn-beijing.volces.com/api/v3 已有路径，硬补会变成
+    // /api/v3/v1 → 404，且用户没有任何办法关掉。
+    if base.is_empty() || base.ends_with("/v1") || url_has_path(base) {
         base.to_string()
     } else {
         format!("{base}/v1")
@@ -584,8 +608,11 @@ pub fn openai_base_url(raw: &str) -> String {
 }
 
 pub fn openai_realtime_base_url(raw: &str) -> String {
+    // 与 openai_base_url 同一契约：带路径就原样用，不再强补 /v1
+    // （否则 https://host/api/v3 → /api/v3/v1、https://host/v1beta → /v1beta/v1）。
     let base = raw.trim_end_matches('/');
-    if base.ends_with("/v1") || base.ends_with("/realtime") {
+    if base.is_empty() || base.ends_with("/v1") || base.ends_with("/realtime") || url_has_path(base)
+    {
         base.to_string()
     } else {
         format!("{base}/v1")
@@ -598,6 +625,11 @@ pub fn require_music_enabled(config: &AppConfig) -> anyhow::Result<()> {
 }
 
 pub fn timeout_duration(seconds: f64) -> Duration {
+    // .inf / NaN（yaml 写 .inf 或算出 infinity）会让 from_secs_f64 panic，
+    // 而 release 编译是 panic = "abort"，等于配置写错就把进程打死。
+    if !seconds.is_finite() {
+        return Duration::from_secs_f64(30.0);
+    }
     Duration::from_secs_f64(seconds.max(0.1))
 }
 
@@ -618,7 +650,8 @@ fn resolve_optional_path(root: &Path, path: &mut Option<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppConfig, AsrConfig, AsrProvider, LlmConfig, LlmProtocol, LlmThinkingMode, McpConfig,
+        openai_base_url, openai_realtime_base_url, timeout_duration, AppConfig, AsrConfig, AsrProvider, LlmConfig,
+        LlmProtocol, LlmThinkingMode, McpConfig,
     };
 
     #[test]
@@ -675,6 +708,67 @@ mod tests {
         assert_eq!(config.protocol, LlmProtocol::Anthropic);
         assert_eq!(config.thinking.mode, LlmThinkingMode::Disabled);
         assert_eq!(config.thinking.budget_tokens, 2048);
+    }
+
+    #[test]
+    fn openai_base_url_keeps_existing_path() {
+        // 已带路径的兼容端点不能被强补 /v1（否则变成 /api/v3/v1 → 404）
+        assert_eq!(
+            openai_base_url("https://ark.cn-beijing.volces.com/api/v3"),
+            "https://ark.cn-beijing.volces.com/api/v3"
+        );
+        assert_eq!(
+            openai_base_url("http://192.168.1.106:8088/v1"),
+            "http://192.168.1.106:8088/v1"
+        );
+    }
+
+    #[test]
+    fn openai_realtime_base_url_keeps_existing_path() {
+        assert_eq!(
+            openai_realtime_base_url("https://ark.cn-beijing.volces.com/api/v3"),
+            "https://ark.cn-beijing.volces.com/api/v3"
+        );
+        assert_eq!(
+            openai_realtime_base_url("https://api.example.com/v1beta"),
+            "https://api.example.com/v1beta"
+        );
+        assert_eq!(
+            openai_realtime_base_url("ws://192.168.1.10:8000/v1"),
+            "ws://192.168.1.10:8000/v1"
+        );
+        assert_eq!(
+            openai_realtime_base_url("http://192.168.1.10:8000/realtime"),
+            "http://192.168.1.10:8000/realtime"
+        );
+    }
+
+    #[test]
+    fn base_url_keeps_empty_input_as_is() {
+        assert_eq!(openai_base_url(""), "");
+        assert_eq!(openai_realtime_base_url(""), "");
+        assert_eq!(timeout_duration(f64::INFINITY), std::time::Duration::from_secs(30));
+        assert_eq!(timeout_duration(f64::NAN), std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn openai_realtime_base_url_appends_v1_for_bare_host() {
+        assert_eq!(
+            openai_realtime_base_url("http://192.168.1.10:8000"),
+            "http://192.168.1.10:8000/v1"
+        );
+    }
+
+    #[test]
+    fn openai_base_url_appends_v1_for_bare_host() {
+        assert_eq!(
+            openai_base_url("http://192.168.1.10:8000"),
+            "http://192.168.1.10:8000/v1"
+        );
+        assert_eq!(
+            openai_base_url("https://api.openai.com/"),
+            "https://api.openai.com/v1"
+        );
     }
 
     #[test]

@@ -28,6 +28,13 @@ pub struct McpConnections {
 }
 
 impl McpConnections {
+    /// 空实现：未启用工具时使用，避免无谓的连接与阻塞。
+    pub fn empty() -> Self {
+        Self {
+            supervisors: Vec::new(),
+        }
+    }
+
     pub async fn connect(config: Arc<AppConfig>, tool_server: ToolServerHandle) -> Self {
         let mut supervisors = Vec::new();
 
@@ -40,13 +47,29 @@ impl McpConnections {
                 continue;
             }
 
-            let service = match connect_mcp_server(&server, tool_server.clone()).await {
-                Ok(service) => {
+            // 连接整体加超时：server.timeout_s 只作用于工具调用，
+            // 连接/initialize/list_tools 没有超时会让 HA 离线时卡住整个启动。
+            let wait = std::time::Duration::from_secs_f64(server.timeout_s.max(1.0) * 2.0);
+            let service = match tokio::time::timeout(
+                wait,
+                connect_mcp_server(&server, tool_server.clone()),
+            )
+            .await
+            {
+                Ok(Ok(service)) => {
                     info!(server = %server.name, "connected MCP tools");
                     Some(service)
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     warn!(server = %server.name, "failed to connect MCP server: {err}");
+                    None
+                }
+                Err(_) => {
+                    warn!(
+                        server = %server.name,
+                        "MCP connect timed out after {:?}, continuing without it",
+                        wait
+                    );
                     None
                 }
             };
