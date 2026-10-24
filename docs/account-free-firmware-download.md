@@ -14,7 +14,10 @@ OTA='{"url":"<下面算出来的地址>","model":"OH2P","version":"1.62.2"}' bas
 
 这条路是实测过的：2026-10-24 用下面的脚本算出 OH2P 1.62.2 的地址，直接 GET 就拿到了官方固件直链
 （`code=0`、`data.currentInfo.link`、`hash=bc81f5b40f3db5e9a9d5943616cd9d93`、约 36 MB），
-全程没有登录任何小米账号。
+全程没有登录任何小米账号；随后**另一个环境用同一算法独立复现**，返回的 `hash` 与大小完全一致。
+
+> 这个 secret 是小米客户端里的公开常量，**不是账号凭据**；它只用于获取官方固件——
+> 不要拿它做别的事，也不要把下载到的固件再分发。
 
 ## 地址怎么算
 
@@ -54,9 +57,10 @@ print(ota_url("OH2P", "1.62.2"))
 
 ## 剩下的边界
 
-- 这个 secret 是小米客户端里的公开常量，不是账号凭据；但它只用来**取官方固件**，
-  不要拿它做别的事，也不要把下载到的固件再分发。
 - 只对 `channel=release` 有效；`current` / `stable` 频道未验证。
 - 地址里的 `time` 参与签名，过期不失效但每次最好重新算，避免被缓存搅乱。
-- `.env` 里的 `MI_DID` 仍然要填**设备名**（如 `小爱音箱Pro`），不是小米账号；
-  这是 PR 里 `ota.ts` 第 15 行本来就用对的参数（见 upstream issue #14 的核实结论）。
+- `.env` 里的 `MI_DID` 仍然要填**设备名**（如 `小爱音箱Pro`），不是小米账号。
+  这一条容易搞错，但**不是历史遗留 bug**：`ota.ts` 从首个提交 `e346d70` 起就是
+  `did: process.env.MI_DID!`（`userId` 才是 `MI_USER`），全历史里从未出现过 `did: MI_USER`。
+  验证方法：`git show e346d70:deploy/client-patch/src/ota.ts | grep -n "did:"`
+  与 `git log --all -S "did: process.env.MI_USER" -- deploy/client-patch/src/ota.ts`（后者应为空）。
