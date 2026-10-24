@@ -59,6 +59,7 @@ gh api repos/<owner>/<repo> \
 | 配置热更新（RWMutex 整体替换） | `apps/chat/engine.go` | #10 SIGHUP 热加载 |
 | QEMU 无刷机调试环境 | `tools/runtime/Dockerfile` | #14 QEMU 环境 |
 | 免账号 OTA 下载思路 | 见 `docs/account-free-firmware-download.md` | 已落地（#14 残项） |
+| `stat` 取文件大小的跨平台回退 | `tools/client-patch/src/squashfs.sh` | 已落地（fork PR #9）——**这条思路来自 cxjava，不是原创**：我们按它的「先试 GNU、再退 BSD」扩成四级回退，并加了「取不到数字就报错退出」 |
 
 ### `duhow/xiaoai-patch`（GPL-3.0）—— **只读方法，不并代码**
 
