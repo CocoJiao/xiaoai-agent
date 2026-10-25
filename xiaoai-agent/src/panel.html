@@ -271,7 +271,7 @@
   // 七态。判定顺序即「先修最小的事」：令牌是本地问题，链路是设备问题。
   var S = {
     AUTH_MISSING: { tone: "idle", title: "还没填访问令牌", detail: "展开下面的「访问令牌」填一次，之后就记在这台浏览器里。" },
-    NO_AUTH:      { tone: "warn", title: "在线，但没启用鉴权", detail: "这台设备的 server.token 为空：同一网段内谁都能读状态，之后的动作端点同理。建议在 agent.yaml 里设一个。" },
+    NO_AUTH:      { tone: "warn", title: "在线，但没启用鉴权", detail: "server.token 为空且只绑回环：本机（或隧道过来）能读，其他主机连不上。要绑内网地址必须先设 token，否则控制面会拒绝启动。" },
     UNREACHABLE:  { tone: "warn", title: "连不上控制面", detail: "地址端口不对，或 agent.yaml 里 server.enabled 是 false。语音链路不受影响。" },
     AUTH_BAD:     { tone: "warn", title: "令牌被拒（401）", detail: "和 agent.yaml 的 server.token 不一致，重新粘贴一次。" },
     SOCKET_LOST:  { tone: "bad",  title: "麦克风被抢回（503）", detail: "进程还活着，但 speech.usock 已经不归它了。需要在设备上执行 start-agent.sh restart。" },
@@ -343,9 +343,13 @@
   function render(key, detail) {
     var s = S[key] || S.UNREACHABLE;
     $("verdict").setAttribute("data-tone", s.tone);
-    $("vtitle").textContent = s.title;
-    $("vdetail").textContent = (detail === undefined) ? s.detail : detail;
-    document.title = s.title + " · XiaoAI 控制台";
+    // 只有文字真的变了才写：live region 里每 5 秒重写一次同样的字，部分读屏会重复播报。
+    if ($("vtitle").textContent !== s.title) {
+      $("vtitle").textContent = s.title;
+      document.title = s.title + " · XiaoAI 控制台";
+    }
+    var text = (detail === undefined) ? s.detail : detail;
+    if ($("vdetail").textContent !== text) $("vdetail").textContent = text;
     // 没有可轮询的东西时，「暂停」留着只会让人以为点了有用。
     $("toggleBtn").disabled = !token() && !run.noAuth;
   }
@@ -456,8 +460,11 @@
     }
 
     if (run.failures >= STALE_AFTER) {
-      var tail = run.lastOkAt
-        ? ("下面的数字是 " + clock(run.lastOkAt) + " 的。")
+      // 和页脚的「数据时刻」取同一个来源：snapshot.at。原来一个用 run.lastOkAt，
+      // 同一屏会并排出现差几秒的两个时刻。
+      var dataAt = (snapshot && snapshot.at) ? snapshot.at : run.lastOkAt;
+      var tail = dataAt
+        ? ("下面的数字是 " + clock(dataAt) + " 的。")
         : "还没有成功读到过状态。";
       render("STALE", "已连续 " + run.failures + " 次没拿到数据（" + netReason(h.error) + "）。" + tail);
     } else {
@@ -519,6 +526,14 @@
     clearTimeout(run.timer);
     run.timer = null;
   }
+
+  // 没有 <form>（CSP form-action 'none'），回车必须自己接，否则贴完令牌下意识敲回车没反应。
+  $("token").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      $("saveBtn").click();
+    }
+  });
 
   $("saveBtn").addEventListener("click", function () {
     var value = token();
