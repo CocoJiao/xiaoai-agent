@@ -109,6 +109,8 @@
   .fact { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
   .fact dt { font-size: 11.5px; color: var(--fg-3); margin-bottom: 5px; }
   .fact dd { margin: 0; font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+  /* 绝对时刻：排障时要拿它去和 agent.log 对时间，相对时长对不上。 */
+  .fact dd .sub { display: block; margin-top: 3px; font-size: 11px; font-weight: 400; letter-spacing: 0; color: var(--fg-3); }
 
   details.fold {
     margin-top: 12px;
@@ -197,11 +199,11 @@
     <span class="host" id="host"></span>
   </div>
 
-  <section class="verdict" id="verdict" data-tone="idle" aria-live="polite">
+  <section class="verdict" id="verdict" data-tone="idle">
     <span class="dot" aria-hidden="true"></span>
     <div class="vtext">
-      <p class="vtitle" id="vtitle">正在读取状态</p>
-      <p class="vdetail" id="vdetail">页面自身不需要令牌，读状态需要。</p>
+      <p class="vtitle" id="vtitle" aria-live="polite">正在读取状态</p>
+      <p class="vdetail" id="vdetail" aria-live="off">页面自身不需要令牌，读状态需要。</p>
     </div>
     <div class="vacts">
       <button type="button" class="btn" id="toggleBtn">暂停</button>
@@ -211,12 +213,12 @@
 
   <dl class="facts">
     <div class="fact"><dt>已运行</dt><dd id="fUptime">—</dd></div>
-    <div class="fact"><dt>上次收包</dt><dd id="fPacket">—</dd></div>
+    <div class="fact"><dt>上次收包</dt><dd><span id="fPacket">—</span><span class="sub" id="fPacketAt"></span></dd></div>
     <div class="fact"><dt>异常重启</dt><dd id="fRestarts">—</dd></div>
   </dl>
 
   <details class="fold" id="diagFold">
-    <summary>诊断与原始数据<span class="count">5 项</span></summary>
+    <summary>诊断与原始数据<span class="count" id="diagCount">—</span></summary>
     <div class="foldbody">
       <dl class="diag">
         <div><dt>socket</dt><dd id="dSocket">—</dd></div>
@@ -259,16 +261,17 @@
   var STALE_AFTER = 3;
   var BAD_TOKEN_MS = 30000;
   var TIMEOUT_MS = 4000;
-  var FOOT_IDLE = "每 5 秒刷新 · 标签页隐藏时自动暂停";
+  var FOOT_IDLE = "刷新间隔 5 秒 · 标签页隐藏时自动暂停";
 
   var $ = function (id) { return document.getElementById(id); };
 
-  var run = { timer: null, failures: 0, lastOkAt: 0, paused: false, busy: false, nextDelay: BASE_MS };
+  var run = { timer: null, failures: 0, lastOkAt: 0, paused: false, busy: false, nextDelay: BASE_MS, noAuth: false, lost: 0 };
   var snapshot = null;
 
   // 七态。判定顺序即「先修最小的事」：令牌是本地问题，链路是设备问题。
   var S = {
     AUTH_MISSING: { tone: "idle", title: "还没填访问令牌", detail: "展开下面的「访问令牌」填一次，之后就记在这台浏览器里。" },
+    NO_AUTH:      { tone: "warn", title: "在线，但没启用鉴权", detail: "这台设备的 server.token 为空：同一网段内谁都能读状态，之后的动作端点同理。建议在 agent.yaml 里设一个。" },
     UNREACHABLE:  { tone: "warn", title: "连不上控制面", detail: "地址端口不对，或 agent.yaml 里 server.enabled 是 false。语音链路不受影响。" },
     AUTH_BAD:     { tone: "warn", title: "令牌被拒（401）", detail: "和 agent.yaml 的 server.token 不一致，重新粘贴一次。" },
     SOCKET_LOST:  { tone: "bad",  title: "麦克风被抢回（503）", detail: "进程还活着，但 speech.usock 已经不归它了。需要在设备上执行 start-agent.sh restart。" },
@@ -298,15 +301,22 @@
   }
 
   function clock(ms) {
-    var d = new Date(ms);
+    var d = new Date(ms), now = new Date();
     var pad = function (n) { return n < 10 ? "0" + n : String(n); };
-    return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+    var hms = pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+    // 「数据时刻 22:10:03」可能是昨晚的，跨天必须带日期。
+    var sameDay = d.getFullYear() === now.getFullYear()
+      && d.getMonth() === now.getMonth()
+      && d.getDate() === now.getDate();
+    return sameDay ? hms : (pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + hms);
   }
 
+  // 不靠浏览器文案匹配：Chrome 是 "Failed to fetch"，Safari 是 "Load failed"，
+  // Firefox 是 "NetworkError when attempting to fetch resource"——按类型判才跨浏览器。
   function netReason(err) {
     if (!err) return "无响应";
     if (err.name === "AbortError") return "请求超时";
-    if (typeof err.message === "string" && err.message.indexOf("Failed to fetch") >= 0) return "连接被拒绝";
+    if (err.name === "TypeError") return "无法建立连接";
     return "网络错误";
   }
 
@@ -336,13 +346,15 @@
     $("vtitle").textContent = s.title;
     $("vdetail").textContent = (detail === undefined) ? s.detail : detail;
     document.title = s.title + " · XiaoAI 控制台";
-    // 没令牌时根本没有轮询可暂停，按钮留着只会让人以为点了有用。
-    $("toggleBtn").disabled = !token();
+    // 没有可轮询的东西时，「暂停」留着只会让人以为点了有用。
+    $("toggleBtn").disabled = !token() && !run.noAuth;
   }
 
   // 用最近一次成功的数据填格子：过期时保留旧值，但结论条已经说明它过期了。
   function paint(health, status, rtt) {
-    if (health && health.body) {
+    // 只有真正的 health 载荷才覆盖快照：401 的 body 是 {"error":"unauthorized"}，
+    // 用它覆盖会把三张事实卡清成「—」，看着像设备挂了（其实只是令牌错了）。
+    if (health && health.body && health.body.socket) {
       snapshot = { health: health.body, status: (status && status.body) || null, rtt: rtt, at: Date.now() };
     }
     var hb = snapshot ? snapshot.health : {};
@@ -356,6 +368,8 @@
     // 没有数据时说「—」，只有接口真的给了 null 才是「从未收到过」。
     $("fPacket").textContent = !hasSnap ? "—"
       : ((age === null || age === undefined) ? "从未" : dur(age) + "前");
+    $("fPacketAt").textContent = (hasSnap && age !== null && age !== undefined)
+      ? clock(snapshot.at - age * 1000) : "";
     $("fRestarts").textContent = (hasSnap && sp.service_restarts !== null && sp.service_restarts !== undefined)
       ? sp.service_restarts + " 次" : "—";
 
@@ -377,13 +391,17 @@
     var h = health || { status: 0, body: null };
     var age = null;
 
-    if (!token()) {
-      key = "AUTH_MISSING";
-    } else if (!h.status) {
+    if (!h.status) {
+      // 传输层失败与令牌无关，先判它：否则「没令牌」会把「连不上」盖住。
       key = "UNREACHABLE";
       detail = S.UNREACHABLE.detail + "（" + netReason(h.error) + "）";
     } else if (h.status === 401) {
-      key = "AUTH_BAD";
+      if (token()) {
+        key = "AUTH_BAD";
+      } else {
+        key = "AUTH_MISSING";
+        detail = "这台设备要求令牌。展开下面的「访问令牌」填一次，之后就记在这台浏览器里。";
+      }
     } else if (h.status === 503) {
       key = "SOCKET_LOST";
     } else if (h.status === 200 && h.body && h.body.status === "ok") {
@@ -399,6 +417,12 @@
         key = "OK_LIVE";
         detail = dur(age) + "前听到过声音。";
       }
+      // 不带令牌也拿到了 200：服务端 token 为空（control-api.md 里「回环不鉴权」那种）。
+      // 这时不该继续要令牌，但也不该假装没事——控制面是敞开的。
+      if (!token()) {
+        key = "NO_AUTH";
+        detail = S.NO_AUTH.detail;
+      }
     } else {
       key = "UNREACHABLE";
       detail = "控制面返回 HTTP " + h.status + "，页面不认识这个响应。";
@@ -407,13 +431,28 @@
     // 只有「根本拿不到答复」才退避与判过期；503/401 是设备给的明确答复，5 秒照常看它恢复。
     if (key === "UNREACHABLE") {
       run.failures += 1;
-      run.nextDelay = Math.min(BASE_MS * Math.pow(2, run.failures), 60000);
+      // 指数从 failures-1 起才是 5→10→20→40→60；原来的 2^failures 第一次就等 10 秒。
+      run.nextDelay = Math.min(BASE_MS * Math.pow(2, run.failures - 1), 60000);
     } else {
       run.failures = 0;
-      run.nextDelay = (key === "AUTH_BAD") ? BAD_TOKEN_MS : BASE_MS;
+      run.nextDelay = (key === "AUTH_BAD" || key === "AUTH_MISSING") ? BAD_TOKEN_MS : BASE_MS;
     }
-    if (key !== "UNREACHABLE" && key !== "AUTH_BAD") {
+
+    // 一直 503 和刚 503 的处置完全不同：前者基本该重启了，得把持续时间说出来。
+    run.lost = (key === "SOCKET_LOST") ? run.lost + 1 : 0;
+    if (key === "SOCKET_LOST" && run.lost >= 3) {
+      detail = "已连续 " + run.lost + " 次（约 " + dur(run.lost * (BASE_MS / 1000))
+        + "）没能拿回麦克风。先在设备上执行 start-agent.sh restart。";
+    }
+
+    if (key !== "UNREACHABLE" && key !== "AUTH_BAD" && key !== "AUTH_MISSING") {
       run.lastOkAt = Date.now();
+    }
+    // 服务端要不要令牌，由响应本身说了算——它决定「没令牌时还能不能继续轮询」。
+    if (key === "AUTH_MISSING" || key === "AUTH_BAD") {
+      run.noAuth = false;
+    } else if (!token() && key !== "UNREACHABLE") {
+      run.noAuth = true;
     }
 
     if (run.failures >= STALE_AFTER) {
@@ -426,42 +465,53 @@
     }
 
     paint(health, status, rtt);
-    $("footState").textContent = (run.nextDelay === BASE_MS)
-      ? FOOT_IDLE
-      : ("下次刷新 " + Math.round(run.nextDelay / 1000) + " 秒后");
+
+    if (!token() && !run.noAuth) {
+      $("footState").textContent = "没填令牌，不会向设备发请求";
+    } else if (run.nextDelay === BASE_MS) {
+      $("footState").textContent = FOOT_IDLE;
+    } else {
+      $("footState").textContent = "下次刷新 " + Math.round(run.nextDelay / 1000) + " 秒后";
+    }
   }
 
-  function poll() {
+  // probeOnly：没存令牌时只探一次 /health，用来分辨「服务端要令牌」还是「服务端根本没配令牌」。
+  // 只发一次、不进轮询，所以「开着标签页过夜刷 401」这个顾虑仍然成立。
+  function poll(probeOnly) {
     if (run.busy) return;
     run.busy = true;
     var t0 = (window.performance && performance.now) ? performance.now() : Date.now();
+    var done = function () { run.busy = false; schedule(); };
 
-    get("/health").then(function (h) {
-      return get("/status").then(function (st) {
-        return { h: h, st: st };
-      }, function () {
-        return { h: h, st: null };
-      });
-    }).then(function (pair) {
-      var rtt = (window.performance && performance.now) ? Math.round(performance.now() - t0) : null;
-      accept(pair.h, pair.st, rtt);
-    }, function (err) {
-      accept({ status: 0, body: null, error: err }, null, null);
-    }).then(function () {
-      run.busy = false;
-      schedule();
+    // 两个请求并发：串行的话最坏要 8 秒（各 4 秒超时），页脚写的「5 秒」就成了假话。
+    var healthP = get("/health").then(function (h) { return h; }, function (err) {
+      return { status: 0, body: null, error: err };
     });
+
+    if (probeOnly) {
+      healthP.then(function (h) { accept(h, null, null); }).then(done, done);
+      return;
+    }
+
+    var statusP = get("/status").then(function (st) { return st; }, function () { return null; });
+    Promise.all([healthP, statusP]).then(function (pair) {
+      var rtt = (window.performance && performance.now) ? Math.round(performance.now() - t0) : null;
+      accept(pair[0], pair[1], rtt);
+    }).then(done, done);
   }
 
   function schedule() {
     clearTimeout(run.timer);
     run.timer = null;
-    if (run.paused || document.hidden || !token()) return;
+    // 没有令牌且服务端要令牌时，一个请求都不排——否则过夜就是一万多条 401。
+    if (run.paused || document.hidden) return;
+    if (!token() && !run.noAuth) return;
     run.timer = setTimeout(tick, run.nextDelay);
   }
 
   function tick() {
-    if (run.paused || document.hidden || !token()) return;
+    if (run.paused || document.hidden) return;
+    if (!token() && !run.noAuth) return;
     poll();
   }
 
@@ -480,6 +530,8 @@
     $("tokenState").textContent = "已保存";
     $("tokenFold").open = false;
     run.failures = 0;
+    run.lost = 0;
+    run.noAuth = false;
     run.nextDelay = BASE_MS;
     poll();
   });
@@ -492,20 +544,22 @@
     snapshot = null;
     stopPolling();
     run.failures = 0;
+    run.lost = 0;
+    run.noAuth = false;
     run.nextDelay = BASE_MS;
-    render("AUTH_MISSING");
     paint(null, null, null);
-    $("footState").textContent = "没填令牌，不会向设备发请求";
+    // 清掉令牌后再探一次：也许这台设备本来就不需要令牌，不该直接判定「未填」。
+    poll(true);
   });
 
   $("refreshBtn").addEventListener("click", function () {
-    if (!token()) {
-      $("tokenFold").open = true;
-      $("token").focus();
-      return;
-    }
     run.failures = 0;
     run.nextDelay = BASE_MS;
+    if (!token()) {
+      run.noAuth = false;
+      poll(true);
+      return;
+    }
     poll();
   });
 
@@ -525,7 +579,7 @@
   document.addEventListener("visibilitychange", function () {
     if (document.hidden) {
       stopPolling();
-    } else if (!run.paused && token()) {
+    } else if (!run.paused && (token() || run.noAuth)) {
       run.nextDelay = BASE_MS;
       poll();
     }
@@ -537,14 +591,18 @@
     $("host").textContent = location.host;
     $("token").value = saved;
     $("tokenState").textContent = saved ? "已保存" : "未设置";
+    // 诊断项数量自己数，加一行不会再骗人。
+    $("diagCount").textContent = document.querySelectorAll(".diag > div").length + " 项";
     $("tokenFold").open = !saved;
 
     if (saved) {
       poll();
     } else {
-      render("AUTH_MISSING");
+      // 没存令牌也探一次：服务端可能压根没配 token（回环不鉴权），
+      // 那样「等你填令牌」就是一条按提示操作也走不出去的死路。只探一次，不轮询。
       paint(null, null, null);
-      $("footState").textContent = "没填令牌，不会向设备发请求";
+      $("footState").textContent = "正在确认这台设备需不需要令牌…";
+      poll(true);
     }
   })();
 })();
