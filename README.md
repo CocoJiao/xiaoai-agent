@@ -121,6 +121,11 @@ cp xiaoai-agent/agent.example.yaml xiaoai-agent/agent.yaml
   工具返回带时区/星期的结构化结果。
 - `device.command_timeout_s`（默认 `30`）：单条设备命令的最长执行时间。
   系统 TTS 是同步播放，长回复可能需要 50~80 秒，建议按需调到 `60`。
+- `tts`：回答的语音出口。`provider: native`（默认）走设备自带 `tts_play.sh`，由 pns 做回声消除；
+  换成外部 TTS（`provider: openai`）时保持 `suppress_capture_while_playing: true`（默认开）——
+  `miplayer` 放的音频不在 pns 的回声消除参考里，不抑制时麦克风会把答案本身当成用户说话。
+  `playback_tail_ms`（默认 `500`）是播放结束后的余量，`playback_startup_grace_ms`（默认 `3000`）
+  是播放器启动宽限（OH2P 1.62.2 实测约 3.2 秒才真正出声）
 - `mcp.servers`：通用 MCP server 列表；每个 server 可独立配置 URL、token、timeout 和工具 allowlist
 - `music`：音乐服务配置，推荐使用 Navidrome；不需要音乐功能时保持 `music.enabled: false`
 - `runtime` / `capture`：唤醒和录音参数，通常先使用示例值
@@ -136,7 +141,7 @@ kill -HUP "$(cat /tmp/xiaoai-agent/xiaoai-agent.pid)"
 
 生效范围：
 
-- **立即生效（下一轮对话开始用新值）**：`llm`、`agent`、`music`、`capture`、`runtime.session_idle_timeout_s`、`mcp`
+- **立即生效（下一轮对话开始用新值）**：`llm`、`agent`、`music`、`capture`、`tts`、`runtime.session_idle_timeout_s`、`mcp`
 - **需要重启**：`device`（TTS 命令模板、命令超时、LED id）、`asr`、`airplay`。这几段在启动时就被各组件快照下来了，热加载只会在日志里告警「需重启」，实际沿用旧值——不会出现「模板还是旧命令、ID 是新值」这种半套配置
 - **拒绝**：`runtime.speech_socket`。运行中换 socket 会让 mipns 和 agent 各说各话，只告警不改
 
@@ -224,6 +229,10 @@ Agent 启动后会常驻运行：
    Realtime transcription。
 5. 把识别文本交给端侧 Rig Agent，并按需调用 MCP、天气、音乐等工具。
 6. 使用小爱音箱系统 TTS 命令朗读回复。
+7. 外部 TTS（`miplayer`）播放期间抑制采集：那段音频不在 pns 的回声消除参考里，不抑制就会
+   把答案本身当成用户说话（录音一路到 15 秒上限，再把自己的话转写成新问题）。抑制期间
+   **喊唤醒词打断仍然有效**（唤醒由固件层判定），失去的是"不喊唤醒词直接插话"。
+
 
 ## 分层设计
 

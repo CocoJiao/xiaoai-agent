@@ -960,6 +960,7 @@ async fn run_session(
                 match record_utterance_server_vad_streaming(
                     config.capture.clone(),
                     idle_timeout,
+                    &state.playback,
                     &mut turn,
                     &mut stream,
                     move || {
@@ -998,6 +999,7 @@ async fn run_session(
                 let _pcm = match record_utterance_streaming(
                     config.capture.clone(),
                     idle_timeout,
+                    &state.playback,
                     &mut turn,
                     move || {
                         let device = device_for_speech.clone();
@@ -1039,15 +1041,21 @@ async fn run_session(
                 }
             }
         } else {
-            let pcm = match record_utterance(config.capture.clone(), idle_timeout, &mut turn, {
-                let led_user_speaking = led.led_user_speaking;
-                move || {
-                    let device = device_for_speech.clone();
-                    async move {
-                        device.show_led(led_user_speaking).await;
+            let pcm = match record_utterance(
+                config.capture.clone(),
+                idle_timeout,
+                &state.playback,
+                &mut turn,
+                {
+                    let led_user_speaking = led.led_user_speaking;
+                    move || {
+                        let device = device_for_speech.clone();
+                        async move {
+                            device.show_led(led_user_speaking).await;
+                        }
                     }
-                }
-            })
+                },
+            )
             .await
             {
                 Ok(pcm) => pcm,

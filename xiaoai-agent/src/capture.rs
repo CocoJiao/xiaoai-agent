@@ -2,17 +2,60 @@ use bytes::Bytes;
 use std::future::Future;
 use std::time::Duration;
 
-use tokio::time::{sleep, Instant};
+use tokio::time::{interval, sleep, Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use crate::asr::{RealtimeAsrEvent, RealtimeAsrSession};
 use crate::config::CaptureConfig;
 use crate::speech::{SpeechInput, SpeechTurn};
+use crate::tts::PlaybackGate;
 use crate::vad::{SpeechCollector, SpeechEvent};
+
+/// 静音窗状态的轮询间隔。
+///
+/// 窗口内除了「丢弃 PCM」还要**把空闲超时按住**，而 PCM 什么时候断不由我们
+/// 决定，所以用独立心跳，不靠收包驱动。
+const QUIET_POLL: Duration = Duration::from_millis(250);
+
+/// 静音窗的心跳：负责状态迁移的日志，以及在窗口内持续顺延空闲超时。
+///
+/// 返回「现在是否仍在窗口内」。`muted` 由调用方持有，用来识别迁移边沿——
+/// 只有边沿才打日志，否则每 250ms 一条会把设备日志刷满。
+fn poll_quiet(
+    playback: &PlaybackGate,
+    muted: &mut bool,
+    dropped_bytes: &mut usize,
+    turn_id: u64,
+) -> bool {
+    let now_muted = playback.mic_muted();
+    if now_muted != *muted {
+        if now_muted {
+            info!(
+                turn_id,
+                dropped_bytes = *dropped_bytes,
+                remaining_ms = playback
+                    .mic_quiet_remaining()
+                    .map(|left| left.as_millis() as u64)
+                    .unwrap_or(0),
+                "CAPTURE_MUTED 外部播放中：丢弃采集音频（回声中混着答案本身）"
+            );
+        } else {
+            info!(
+                turn_id,
+                dropped_bytes = *dropped_bytes,
+                "CAPTURE_UNMUTED 播放结束，恢复采集"
+            );
+        }
+        *muted = now_muted;
+        *dropped_bytes = 0;
+    }
+    now_muted
+}
 
 pub async fn record_utterance<F, Fut>(
     config: CaptureConfig,
     idle_timeout: Duration,
+    playback: &PlaybackGate,
     turn: &mut SpeechTurn,
     on_speech_start: F,
 ) -> anyhow::Result<Bytes>
@@ -25,6 +68,10 @@ where
     tokio::pin!(idle_timer);
     let mut collector = SpeechCollector::new(&config);
     let mut speech_started = false;
+    let mut muted = false;
+    let mut dropped_bytes = 0_usize;
+    let mut quiet_tick = interval(QUIET_POLL);
+    quiet_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     info!(
         turn_id = turn.id(),
@@ -32,7 +79,22 @@ where
     );
     loop {
         tokio::select! {
+            _ = quiet_tick.tick() => {
+                let was_muted = muted;
+                let now_muted = poll_quiet(playback, &mut muted, &mut dropped_bytes, turn.id());
+                // 进窗要按住空闲超时；出窗要重新起算，否则「已在静音里超时」的
+                // 定时器会在解除的瞬间把会话判掉。
+                if now_muted || was_muted {
+                    idle_timer.as_mut().reset(Instant::now() + idle_timeout);
+                }
+            }
             _ = &mut idle_timer, if !speech_started => {
+                if playback.mic_muted() {
+                    // 静音窗不烧超时。心跳一般已经顺延过；这里兜住两次心跳之间
+                    // 的边沿，也避免「已过期的定时器」在解除瞬间立刻触发。
+                    idle_timer.as_mut().reset(Instant::now() + idle_timeout);
+                    continue;
+                }
                 collector.log_noise_floor("timeout");
                 let _ = turn.stop_capture().await;
                 anyhow::bail!("timed out waiting for user speech");
@@ -40,6 +102,10 @@ where
             input = turn.recv() => {
                 match input {
                     Some(SpeechInput::Pcm(bytes)) => {
+                        if playback.mic_muted() {
+                            dropped_bytes += bytes.len();
+                            continue;
+                        }
                         for event in collector.push(&bytes) {
                             match event {
                                 SpeechEvent::SpeechStart(_) => {
@@ -74,6 +140,7 @@ where
 pub async fn record_utterance_streaming<F, Fut, C, CFut, R, RFut>(
     config: CaptureConfig,
     idle_timeout: Duration,
+    playback: &PlaybackGate,
     turn: &mut SpeechTurn,
     on_speech_start: F,
     on_audio_chunk: C,
@@ -92,6 +159,10 @@ where
     tokio::pin!(idle_timer);
     let mut collector = SpeechCollector::new(&config);
     let mut speech_started = false;
+    let mut muted = false;
+    let mut dropped_bytes = 0_usize;
+    let mut quiet_tick = interval(QUIET_POLL);
+    quiet_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     info!(
         turn_id = turn.id(),
@@ -99,7 +170,22 @@ where
     );
     loop {
         tokio::select! {
+            _ = quiet_tick.tick() => {
+                let was_muted = muted;
+                let now_muted = poll_quiet(playback, &mut muted, &mut dropped_bytes, turn.id());
+                // 进窗要按住空闲超时；出窗要重新起算，否则「已在静音里超时」的
+                // 定时器会在解除的瞬间把会话判掉。
+                if now_muted || was_muted {
+                    idle_timer.as_mut().reset(Instant::now() + idle_timeout);
+                }
+            }
             _ = &mut idle_timer, if !speech_started => {
+                if playback.mic_muted() {
+                    // 静音窗不烧超时。心跳一般已经顺延过；这里兜住两次心跳之间
+                    // 的边沿，也避免「已过期的定时器」在解除瞬间立刻触发。
+                    idle_timer.as_mut().reset(Instant::now() + idle_timeout);
+                    continue;
+                }
                 collector.log_noise_floor("timeout");
                 let _ = turn.stop_capture().await;
                 anyhow::bail!("timed out waiting for user speech");
@@ -107,6 +193,10 @@ where
             input = turn.recv() => {
                 match input {
                     Some(SpeechInput::Pcm(bytes)) => {
+                        if playback.mic_muted() {
+                            dropped_bytes += bytes.len();
+                            continue;
+                        }
                         for event in collector.push(&bytes) {
                             match event {
                                 SpeechEvent::SpeechStart(prefix) => {
@@ -147,6 +237,7 @@ where
 pub async fn record_utterance_server_vad_streaming<F, Fut, E, EFut>(
     config: CaptureConfig,
     idle_timeout: Duration,
+    playback: &PlaybackGate,
     turn: &mut SpeechTurn,
     session: &mut RealtimeAsrSession,
     on_speech_start: F,
@@ -169,6 +260,10 @@ where
     let mut speech_started = false;
     let mut input_closed = false;
     let mut chunks = 0_u64;
+    let mut muted = false;
+    let mut dropped_bytes = 0_usize;
+    let mut quiet_tick = interval(QUIET_POLL);
+    quiet_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     info!(
         turn_id = turn.id(),
@@ -176,7 +271,22 @@ where
     );
     loop {
         tokio::select! {
+            _ = quiet_tick.tick() => {
+                let was_muted = muted;
+                let now_muted = poll_quiet(playback, &mut muted, &mut dropped_bytes, turn.id());
+                // 进窗要按住空闲超时；出窗要重新起算，否则「已在静音里超时」的
+                // 定时器会在解除的瞬间把会话判掉。
+                if now_muted || was_muted {
+                    idle_timer.as_mut().reset(Instant::now() + idle_timeout);
+                }
+            }
             _ = &mut idle_timer, if !speech_started => {
+                if playback.mic_muted() {
+                    // 静音窗不烧超时。心跳一般已经顺延过；这里兜住两次心跳之间
+                    // 的边沿，也避免「已过期的定时器」在解除瞬间立刻触发。
+                    idle_timer.as_mut().reset(Instant::now() + idle_timeout);
+                    continue;
+                }
                 let _ = turn.stop_capture().await;
                 anyhow::bail!("timed out waiting for user speech");
             }
@@ -221,6 +331,10 @@ where
             input = turn.recv(), if !input_closed => {
                 match input {
                     Some(SpeechInput::Pcm(bytes)) => {
+                        if playback.mic_muted() {
+                            dropped_bytes += bytes.len();
+                            continue;
+                        }
                         chunks += 1;
                         if chunks == 1 {
                             debug!(bytes = bytes.len(), "SPEECH_USOCK_FIRST_ASR_CHUNK");
@@ -296,6 +410,7 @@ mod tests {
             test_config(),
             // record_utterance 内部会把上限抬到至少 1s
             Duration::from_secs(1),
+            &PlaybackGate::default(),
             &mut turn,
             || async {},
         )
@@ -303,6 +418,104 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("timed out"), "错误信息应说明超时: {err}");
+        assert_eq!(commands(&recorder).await, vec![TestCommand::StopCapture]);
+    }
+
+    /// 静音窗内进来的 PCM 一条都不能喂 VAD：回声会被判成「用户开口」，一路录到
+    /// `max_utterance` 再送 ASR，于是设备把自己的答案当成新问题（真机 14.7s 那次）。
+    #[tokio::test]
+    async fn muted_audio_never_reaches_the_collector() {
+        let (mut turn, input_tx, recorder) = SpeechTurn::for_test(6);
+        let gate = Arc::new(PlaybackGate::default());
+        let task_gate = gate.clone();
+        let handle = tokio::spawn(async move {
+            record_utterance(
+                test_config(),
+                Duration::from_secs(30),
+                &task_gate,
+                &mut turn,
+                || async {},
+            )
+            .await
+        });
+
+        // 静音窗内送「一次性说得完」的量（4 有声 + 3 静音）：没被丢掉的话这一轮
+        // 早就该返回了。音量取 20000，好在返回的 PCM 里认出来。
+        gate.mute_mic_for(Duration::from_secs(5));
+        for _ in 0..4 {
+            input_tx
+                .send(SpeechInput::Pcm(pcm_block(20_000)))
+                .await
+                .unwrap();
+        }
+        for _ in 0..3 {
+            input_tx.send(SpeechInput::Pcm(pcm_block(0))).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!handle.is_finished(), "静音窗内不许完成采集");
+
+        gate.begin(); // 唤醒打断：播放器已被 killall，窗口跟着撤掉
+        for _ in 0..4 {
+            input_tx
+                .send(SpeechInput::Pcm(pcm_block(1_000)))
+                .await
+                .unwrap();
+        }
+        for _ in 0..3 {
+            input_tx.send(SpeechInput::Pcm(pcm_block(0))).await.unwrap();
+        }
+
+        let pcm = handle.await.unwrap().expect("窗口结束后应能正常采集");
+        assert!(pcm.len() >= 4 * BLOCK_BYTES);
+        let peak = pcm
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            peak <= 1_000,
+            "返回的 PCM 里不该混进静音窗内的回声（peak={peak}）"
+        );
+        assert_eq!(commands(&recorder).await, vec![TestCommand::StopCapture]);
+    }
+
+    /// 静音窗内不许把空闲超时烧掉：默认 20s 比长回答短，播到一半判超时会直接
+    /// 结束整段对话（用户只听到半句话，且没有下一轮）。
+    #[tokio::test]
+    async fn the_idle_timeout_is_paused_while_muted() {
+        let (mut turn, input_tx, recorder) = SpeechTurn::for_test(7);
+        let gate = Arc::new(PlaybackGate::default());
+        let task_gate = gate.clone();
+        let handle = tokio::spawn(async move {
+            record_utterance(
+                test_config(),
+                Duration::from_secs(1),
+                &task_gate,
+                &mut turn,
+                || async {},
+            )
+            .await
+        });
+
+        gate.mute_mic_for(Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_millis(1_400)).await;
+        assert!(!handle.is_finished(), "静音窗内不许判空闲超时");
+
+        gate.begin();
+        // 等一次心跳（250ms）把定时器重新起算：解除静音的瞬间不能靠运气。
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for _ in 0..4 {
+            input_tx
+                .send(SpeechInput::Pcm(pcm_block(10_000)))
+                .await
+                .unwrap();
+        }
+        for _ in 0..3 {
+            input_tx.send(SpeechInput::Pcm(pcm_block(0))).await.unwrap();
+        }
+
+        let pcm = handle.await.unwrap().expect("解除静音后应能正常采集");
+        assert!(pcm.len() >= 4 * BLOCK_BYTES);
         assert_eq!(commands(&recorder).await, vec![TestCommand::StopCapture]);
     }
 
@@ -316,6 +529,7 @@ mod tests {
         let err = record_utterance(
             test_config(),
             Duration::from_secs(30),
+            &PlaybackGate::default(),
             &mut turn,
             || async {},
         )
@@ -336,6 +550,7 @@ mod tests {
         let err = record_utterance(
             test_config(),
             Duration::from_secs(30),
+            &PlaybackGate::default(),
             &mut turn,
             || async {},
         )
@@ -353,6 +568,7 @@ mod tests {
             record_utterance(
                 test_config(),
                 Duration::from_secs(30),
+                &PlaybackGate::default(),
                 &mut turn,
                 || async {},
             )
@@ -390,6 +606,7 @@ mod tests {
             record_utterance_streaming(
                 test_config(),
                 Duration::from_secs(30),
+                &PlaybackGate::default(),
                 &mut turn,
                 || async {},
                 move |chunk: Bytes| {
