@@ -142,6 +142,22 @@ Rules:
   for an inode change, a real `UnixDatagram` for a socket error, a real file for a
   path that must exist.
 
+## Interrupting Playback
+
+Interrupting speech needs **both** halves; either one alone produces the bug the
+user actually notices ("I said stop and it read out one more sentence"):
+
+- `PlaybackGate` (`tts.rs`) — a monotonic token. A new wake / `/stop` / next turn
+  calls `begin()`, and every synthesis step checks `is_active(captured_token)`
+  before it starts playing. This stops work that has **not** started yet.
+- `device.abort_current_output()` — kills `tts_play.sh` / `miplayer`, which are
+  separate processes. `task.abort()` only drops the future; the audio plays on.
+  This stops the sentence that is **already** sounding.
+
+A reply whose token expired mid-synthesis returns `Ok(())` and plays nothing: it
+was interrupted, not failed, so it must not count towards the consecutive-failure
+yield.
+
 ## Configuration Hot Reload
 
 `SIGHUP` re-reads `agent.yaml` in place. The reload is deliberately conservative —

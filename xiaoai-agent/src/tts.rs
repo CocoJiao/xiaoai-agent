@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context};
@@ -23,6 +24,37 @@ use crate::device::Device;
 /// 但那需要先确认压音量对 TTS 播放通道也生效，留待后续。
 pub const DEFAULT_PLAYBACK_COMMAND: &str =
     "killall miplayer 2>/dev/null; miplayer -f {path} >/tmp/xiaoai-tts-player.log 2>&1 &";
+
+/// 播放会话令牌：**打断的判据不是「杀掉任务」，而是「令牌变了」**。
+///
+/// 当前实现里唤醒打断靠 `task.abort()`，但 `tts_play.sh` / `miplayer` 是**独立进程**，
+/// abort 掉 future 不等于杀掉它们——所以「说了闭嘴还多播一两句」。
+/// 令牌解决的是另一个方向：任何**新**会话（唤醒、`/stop`、下一轮）一开始就 `begin()`
+/// 让旧令牌失效，正在进行的合成/播放每完成一步先查一次，失效就闭嘴。
+///
+/// 两条必须一起用：令牌负责「不要再开始新的播放」，`abort_current_output()`
+/// 负责「把已经在响的那句掐掉」。只有令牌，当前这句还会播完；只有 kill，
+/// 已排队但还没起播的句子仍会漏出来。
+#[derive(Debug, Default)]
+pub struct PlaybackGate {
+    token: AtomicU64,
+}
+
+impl PlaybackGate {
+    pub fn current(&self) -> u64 {
+        self.token.load(Ordering::Relaxed)
+    }
+
+    /// 让所有在飞的播放会话失效，返回新令牌。
+    pub fn begin(&self) -> u64 {
+        self.token.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// 抓到的令牌还是当前的吗。
+    pub fn is_active(&self, token: u64) -> bool {
+        self.token.load(Ordering::Relaxed) == token
+    }
+}
 
 /// 连续多少次 TTS 失败后升级成 `error`。
 ///
@@ -72,11 +104,12 @@ impl TtsHealth {
 /// 是回退系统 TTS 还是报错。
 pub struct TtsRouter {
     device: Device,
+    gate: Arc<PlaybackGate>,
 }
 
 impl TtsRouter {
-    pub fn new(device: Device) -> Self {
-        Self { device }
+    pub fn new(device: Device, gate: Arc<PlaybackGate>) -> Self {
+        Self { device, gate }
     }
 
     /// 念一句话。
@@ -88,9 +121,12 @@ impl TtsRouter {
         if text.trim().is_empty() {
             return Ok(());
         }
+        // 抓一次令牌：本轮从合成到播放用的都是它。中途有人喊唤醒（或 `/stop`）就会
+        // begin() 一次，这里在真正出声前发现自己过期，于是闭嘴而不是补播一句。
+        let token = self.gate.current();
         match config.provider {
             TtsProvider::Native => self.device.speak(text).await,
-            provider => self.speak_remote(config, provider, text).await,
+            provider => self.speak_remote(config, provider, text, token).await,
         }
     }
 
@@ -99,9 +135,10 @@ impl TtsRouter {
         config: &TtsConfig,
         provider: TtsProvider,
         text: &str,
+        token: u64,
     ) -> anyhow::Result<()> {
         let attempt = match provider {
-            TtsProvider::OpenAi => self.speak_openai(config, text).await,
+            TtsProvider::OpenAi => self.speak_openai(config, text, token).await,
             TtsProvider::Doubao => Err(anyhow!("tts provider Doubao 尚未接入")),
             TtsProvider::Native => unreachable!("native 不会走到这里"),
         };
@@ -118,7 +155,7 @@ impl TtsRouter {
         }
     }
 
-    async fn speak_openai(&self, config: &TtsConfig, text: &str) -> anyhow::Result<()> {
+    async fn speak_openai(&self, config: &TtsConfig, text: &str, token: u64) -> anyhow::Result<()> {
         let tts = &config.openai;
         if tts.api_key.trim().is_empty() {
             bail!("tts.openai.api_key 为空");
@@ -127,6 +164,14 @@ impl TtsRouter {
         prune_old_speech_files(&tts.dir());
         let path = speech_output_path(&tts.dir(), &tts.response_format);
         let bytes = self.fetch_openai_speech(tts, text).await?;
+
+        // 合成这一步可能要几百毫秒到几秒：期间用户可能已经喊了唤醒词。
+        // 这时候**不要**再出声——旧行为是照样播完，用户听到的是「他已经问下一句了，
+        // 音箱还在念上一句的答案」。
+        if !self.gate.is_active(token) {
+            debug!("本轮回答在合成期间被打断，跳过播放");
+            return Ok(());
+        }
         tokio::fs::write(&path, &bytes)
             .await
             .with_context(|| format!("写音频文件失败: {}", path.display()))?;
@@ -282,7 +327,20 @@ mod tests {
     use crate::shell::RecordingShell;
 
     fn router(shell: Arc<RecordingShell>) -> TtsRouter {
-        TtsRouter::new(Device::with_runner(DeviceConfig::default(), shell))
+        TtsRouter::new(
+            Device::with_runner(DeviceConfig::default(), shell),
+            Arc::new(PlaybackGate::default()),
+        )
+    }
+
+    /// CRLF 用 13/10 拼：源码里不出现转义序列，避免被工具链改写（踩过一次）。
+    fn crlf() -> String {
+        [13_u8, 10_u8].iter().map(|byte| *byte as char).collect()
+    }
+
+    /// 带独立令牌的 router：测试要自己控制「什么时候被打断」。
+    fn router_with_gate(shell: Arc<RecordingShell>, gate: Arc<PlaybackGate>) -> TtsRouter {
+        TtsRouter::new(Device::with_runner(DeviceConfig::default(), shell), gate)
     }
 
     /// 一个必定连接被拒的 OpenAI 兼容端点：不碰外网、失败得又快又确定。
@@ -401,6 +459,73 @@ mod tests {
             .to_string();
         assert!(err.contains("fallback_to_native=false"), "{err}");
         assert_eq!(shell.command_count(), 0);
+    }
+
+    /// 令牌语义：`begin()` 之后旧令牌立刻失效，新令牌有效。
+    #[test]
+    fn beginning_a_session_invalidates_the_old_token() {
+        let gate = PlaybackGate::default();
+        let first = gate.current();
+        assert!(gate.is_active(first));
+
+        let second = gate.begin();
+        assert!(!gate.is_active(first), "begin() 之后旧令牌必须失效");
+        assert!(gate.is_active(second));
+        assert_eq!(gate.begin(), second + 1, "令牌必须单调递增");
+    }
+
+    /// 合成期间被打断（用户喊了唤醒词）→ **不播**，但也不算失败。
+    ///
+    /// 这条钉的是「说了闭嘴还多播一句」那个体感：旧代码在这里照样把音频交给播放器。
+    #[tokio::test]
+    async fn a_reply_interrupted_during_synthesis_is_not_played() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // 慢后端：300ms 后才回音频，留出「合成期间被打断」的窗口。
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0_u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let body = b"RIFFfake-wav";
+                let nl = crlf();
+                let head = format!("HTTP/1.1 200 OK{nl}Content-Length: {}{nl}{nl}", body.len());
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+            }
+        });
+
+        let shell = Arc::new(RecordingShell::always_ok());
+        let gate = Arc::new(PlaybackGate::default());
+        let router = router_with_gate(shell.clone(), gate.clone());
+
+        let config = TtsConfig {
+            provider: TtsProvider::OpenAi,
+            openai: OpenAiTtsConfig {
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                api_key: "sk-test".to_string(),
+                timeout_s: 5.0,
+                output_dir: Some(std::env::temp_dir()),
+                ..OpenAiTtsConfig::default()
+            },
+            ..TtsConfig::default()
+        };
+
+        // 100ms 后「用户喊了唤醒词」。
+        let interrupter = gate.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            interrupter.begin();
+        });
+
+        router.speak(&config, "这句不该被念出来").await.unwrap();
+        assert_eq!(
+            shell.count_matching("miplayer"),
+            0,
+            "合成期间被打断时不能再去起播放器"
+        );
     }
 
     /// 失败计数：到阈值前只 warn，连续三次后升 error；成功一次就清零。

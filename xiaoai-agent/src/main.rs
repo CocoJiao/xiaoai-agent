@@ -39,7 +39,7 @@ use crate::device::Device;
 use crate::music::MusicService;
 use crate::shell::TIMEOUT_ERROR_PREFIX;
 use crate::speech::{SocketOwnership, SpeechHandle, SpeechService, SpeechServiceEvent, SpeechTurn};
-use crate::tts::{TtsHealth, TtsRouter};
+use crate::tts::{PlaybackGate, TtsHealth, TtsRouter};
 
 /// TTS 健康度是**进程级**的：局部变量会随每次 `run_session` 归零，
 /// 「坏了三天」就永远攒不到阈值。
@@ -94,6 +94,8 @@ async fn main() -> anyhow::Result<()> {
     let airplay = AirPlayService::start(initial.airplay.clone()).await?;
     let agent = Arc::new(AgentRuntime::new(config.clone(), device.clone(), music.clone()).await?);
     let failures = Arc::new(AtomicU32::new(0));
+    // 播放令牌：进程级。唤醒/停止都会 begin()，见 tts.rs 的 PlaybackGate 文档。
+    let playback = Arc::new(PlaybackGate::default());
     let (reload_tx, mut reload_rx) = mpsc::channel::<()>(1);
     spawn_sighup_listener(reload_tx);
     // 重载去抖门：同时只跑一个，期间的请求合并成下一轮。
@@ -142,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
                             let _ = active.task.await;
                             let state = build_turn_state(
                                 &config, &initial.device, &device, &asr, &agent, &music,
-                                &airplay, &failures,
+                                &airplay, &playback, &failures,
                             );
                             // 服务已经报故障，收尾命令可能没人应答；给 2s 上限，
                             // 别让「让位」本身卡在一个等不到回复的 oneshot 上。
@@ -174,7 +176,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                         let state = build_turn_state(
                             &config, &initial.device, &device, &asr, &agent, &music, &airplay,
-                            &failures,
+                            &playback, &failures,
                         );
                         if let Some(active) = active_session.take() {
                             let interrupted = active.turn_id.load(Ordering::Relaxed);
@@ -195,6 +197,9 @@ async fn main() -> anyhow::Result<()> {
                             agent.reset_session("wake keyword").await;
                         }
 
+                        // 先让所有在飞的合成/播放失效：合成中的回答会在出声前
+                        // 发现自己过期，于是闭嘴而不是补播一句。
+                        state.playback.begin();
                         let music_interrupted = music.interrupt_for_wake().await;
                         let airplay_interrupted = airplay.interrupt_for_wake().await;
                         if !music_interrupted && !airplay_interrupted {
@@ -390,6 +395,8 @@ struct TurnState {
     airplay: AirPlayService,
     /// 连续失败轮数。到阈值就说明「能唤醒但答不上」已经持续了整段会话，
     /// 与其继续硬撑，不如把麦克风还给原厂小爱。
+    /// 播放令牌：唤醒 / `/stop` / 新一轮都会 `begin()`，让还在飞的合成与播放失效。
+    playback: Arc<PlaybackGate>,
     failures: Arc<AtomicU32>,
 }
 
@@ -405,6 +412,7 @@ fn build_turn_state(
     agent: &Arc<AgentRuntime>,
     music: &Arc<MusicService>,
     airplay: &AirPlayService,
+    playback: &Arc<PlaybackGate>,
     failures: &Arc<AtomicU32>,
 ) -> TurnState {
     TurnState {
@@ -415,6 +423,7 @@ fn build_turn_state(
         agent: agent.clone(),
         music: music.clone(),
         airplay: airplay.clone(),
+        playback: playback.clone(),
         failures: failures.clone(),
     }
 }
@@ -1074,7 +1083,7 @@ async fn run_session(
             // 已经答出来。而且配置了 fallback_to_native: false 的人预期是「宁可
             // 不说话」，若因此让位，音箱会整体下线等人工 start-agent.sh start，
             // 落差太大。所以这里只 warn + 继续这一轮剩下的流程。
-            match TtsRouter::new(state.device.clone())
+            match TtsRouter::new(state.device.clone(), state.playback.clone())
                 .speak(&config.tts, &reply.text)
                 .await
             {
@@ -1222,6 +1231,7 @@ mod tests {
             agent,
             music,
             airplay,
+            playback: Arc::new(PlaybackGate::default()),
             failures: Arc::new(AtomicU32::new(0)),
         }
     }
