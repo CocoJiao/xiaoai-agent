@@ -215,6 +215,25 @@ A config field added under `tts` stays hot-reloadable only because
 `classify_config_change` lists the whole section as `applied` — moving these
 fields into `device` or `capture` would make them restart-only.
 
+### Verifying it on the device
+
+`verify-quiet-window.sh start` records the current log offset and prints the
+three interactions to perform; `verify-quiet-window.sh check` then asserts
+against **only** the bytes appended since that offset. That indirection is the
+point: `agent.log` is append-only across days, so a plain `grep` would count
+last week's `end=max_duration` and turn "verified" into an illusion.
+
+`check` exits 0 only when all five assertions pass — the window actually opened
+(`CAPTURE_MUTED`), it was shrunk by `EndReached` rather than the cap, no
+"no EndReached" warning leaked out of an interruption, no utterance reached
+`end=max_duration`, and no `timed out waiting for user speech` (the last one
+also watches whether `mipns` closes the stream on its own). It additionally
+prints each mute→unmute interval, which is read against the reply's length:
+≈ audio duration + 3 s means the window followed playback, close to
+`grace + 2 × duration + 10 s` means it ate the cap — the one thing a green run
+must not hide. It needs `tts.provider` to be an external player (`native` never
+mutes, so there is nothing to measure) and `RUST_LOG` at `info`.
+
 ## Control Plane Auth
 
 The local control plane (`server` section) is off by default and binds loopback

@@ -48,6 +48,7 @@ jobs:
       - name: Shell syntax check
         run: |
           bash -n xiaoai-agent/start-agent.sh
+          bash -n xiaoai-agent/verify-quiet-window.sh
           bash -n deploy/client-patch/src/build.sh
           bash -n deploy/client-patch/src/extract.sh
 
