@@ -163,6 +163,27 @@ A reply whose token expired mid-synthesis returns `Ok(())` and plays nothing: it
 was interrupted, not failed, so it must not count towards the consecutive-failure
 yield.
 
+## Control Plane Auth
+
+The local control plane (`server` section) is off by default and binds loopback
+unless configured otherwise. Its whole security model rests on one property:
+**cross-site requests cannot carry custom headers**, so a request without
+`Authorization: Bearer` can only come from something that cannot set headers.
+
+Two rules follow, and both are load-bearing:
+
+- **Every route except the panel (`/`) requires auth**, and it is enforced by a
+  router-level layer (`require_token`), not by each handler remembering to call
+  `authorize`. Adding a route without the layer fails the route-level test.
+- **State-changing endpoints must not be GET.** An unauthenticated `GET /stop`
+  would be reachable from any web page (`<img src=…>`), because the victim's
+  browser needs no header to send it. Such a page would be a CSRF pivot for the
+  speaker: any site could make it talk or stop talking.
+
+The panel itself is public because it is inert: one static HTML file, no device
+data, token typed once and kept in `localStorage`. Never put the token in a query
+string — it leaks into history, proxy logs and `Referer`.
+
 ## Configuration Hot Reload
 
 `SIGHUP` re-reads `agent.yaml` in place. The reload is deliberately conservative —

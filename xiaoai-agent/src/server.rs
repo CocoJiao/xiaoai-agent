@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -60,10 +60,7 @@ pub async fn spawn(
         "本地控制面已启动"
     );
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/status", get(status))
-        .with_state(state);
+    let app = build_router(state);
 
     let handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
@@ -73,19 +70,81 @@ pub async fn spawn(
     Ok(Some(handle))
 }
 
-async fn health(State(state): State<Arc<ControlState>>, headers: HeaderMap) -> Response {
-    let (status, body) = health_response(&state);
-    match authorize(&state.token, &headers) {
-        Ok(()) => (status, Json(body)).into_response(),
+fn build_router(state: Arc<ControlState>) -> Router {
+    // 鉴权写成 layer，而不是让每个 handler 自己记得调 authorize：
+    // #9 下一步就是 /stop、/play/*，新增端点的人只要漏抄那几行就是一个
+    // **无鉴权的控制端点**，而路由结构不会提醒他。现在默认受保护，
+    // 要公开必须显式挂到下面这条 Router 上。
+    let api = Router::new()
+        .route("/health", get(health))
+        .route("/status", get(status))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_token,
+        ));
+
+    Router::new()
+        .route("/", get(panel))
+        .merge(api)
+        .with_state(state)
+}
+
+/// 统一的 Bearer 校验。**所有非公开路由都过这里**。
+///
+/// 这套设计成立的前提只有一条：跨站请求带不上自定义头。所以任何会改变状态的
+/// 端点都必须要求 `Authorization`，且不该用 GET（`<img>`/`<a>`/`<form>` 都能触发
+/// GET，但都带不上 Bearer——GET + 不鉴权 = CSRF 跳板）。
+async fn require_token(
+    State(state): State<Arc<ControlState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match authorize(&state.token, request.headers()) {
+        Ok(()) => next.run(request).await,
         Err(status) => (status, Json(json!({ "error": "unauthorized" }))).into_response(),
     }
 }
 
-async fn status(State(state): State<Arc<ControlState>>, headers: HeaderMap) -> Response {
-    match authorize(&state.token, &headers) {
-        Ok(()) => Json(status_body(&state)).into_response(),
-        Err(status) => (status, Json(json!({ "error": "unauthorized" }))).into_response(),
-    }
+/// 控制台页面。**故意不鉴权**：它只是一张静态 HTML，本身不含任何设备信息，
+/// token 由页面里输入一次、存 localStorage，之后的请求才带 Authorization。
+/// 这样运维不用记 curl；同时也不会把 token 写进 URL（历史、日志都会留痕）。
+async fn panel() -> Response {
+    // 面板只有内联样式与脚本：
+    // - `default-src 'none'` + `connect-src 'self'`：页面永远不加载外部资源（和
+    //   「无 CDN」的目标一致），请求只能打到本机；
+    // - `frame-ancestors 'none'`：不能被嵌进 iframe —— 第二步加了「停止播放」
+    //   这类按钮后，点击劫持就成立了。
+    let csp = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';                connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+    (
+        [
+            (axum::http::header::CONTENT_SECURITY_POLICY, csp),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        Html(PANEL_HTML),
+    )
+        .into_response()
+}
+
+/// 单文件控制台：无外部依赖（设备上没有 CDN 也要能开）。
+/// 放在独立的 `.html` 里而不是 raw string：编辑器有高亮、diff 只显示 HTML、
+/// 也不会因为 JS 里出现 `"#` 而静默截断。
+const PANEL_HTML: &str = include_str!("panel.html");
+
+async fn health(State(state): State<Arc<ControlState>>) -> Response {
+    let (status, body) = health_response(&state);
+    (status, no_store(), Json(body)).into_response()
+}
+
+async fn status(State(state): State<Arc<ControlState>>) -> Response {
+    (StatusCode::OK, no_store(), Json(status_body(&state))).into_response()
+}
+
+/// 监控端点被缓存没有任何好处（`fetch` 默认会走 HTTP 缓存），显式禁掉。
+fn no_store() -> [(axum::http::header::HeaderName, &'static str); 2] {
+    [
+        (axum::http::header::CACHE_CONTROL, "no-store"),
+        (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+    ]
 }
 
 /// 探活判据：**只看一件不会撒谎的事实——speech socket 还是不是我们的**。
@@ -284,6 +343,81 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    /// 控制台页面：不带令牌也能打开（它只是一张静态页），但页面里的 API 仍然要鉴权。
+    #[tokio::test]
+    async fn panel_opens_without_a_token_but_the_api_still_requires_one() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = state_with_ownership("s3cret", still_owned_socket("panel"));
+        let app = build_router(state.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let page = reqwest::get(format!("http://127.0.0.1:{port}/"))
+            .await
+            .unwrap();
+        assert_eq!(page.status(), 200);
+        let body = page.text().await.unwrap();
+        assert!(body.contains("XiaoAI 控制台"), "页面应当包含标题");
+        assert!(
+            body.contains("/health") && body.contains("Bearer"),
+            "页面要真的去调 API，并且用 Bearer"
+        );
+
+        // 除了面板，**每一条**路由都必须要求鉴权。这是路由级断言：
+        // 新增端点忘了挂 layer 会直接红。
+        for path in ["/health", "/status"] {
+            let unauth = reqwest::get(format!("http://127.0.0.1:{port}{path}"))
+                .await
+                .unwrap();
+            assert_eq!(unauth.status(), 401, "{path} 无令牌必须 401");
+        }
+
+        let authed = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .bearer_auth("s3cret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            authed.status(),
+            200,
+            "带对令牌要拿到 200（socket 仍归本进程）"
+        );
+        assert_eq!(
+            authed
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "监控端点不能被缓存"
+        );
+
+        // 面板与 API 的字段契约：改名必须两边一起改，否则页面静默显示 0。
+        let body: Value = authed.json().await.unwrap();
+        assert!(body["uptime_s"].is_u64(), "uptime_s 必须是数字");
+        assert!(
+            body["socket"]["owned"].is_boolean(),
+            "socket.owned 必须是布尔"
+        );
+        assert!(
+            body["speech"]["service_restarts"].is_u64(),
+            "speech.service_restarts 必须是数字"
+        );
+        assert!(
+            body["speech"].get("last_packet_age_s").is_some(),
+            "last_packet_age_s 允许是 null，但键必须在"
+        );
+        for field in ["uptime_s", "service_restarts", "last_packet_age_s", "owned"] {
+            assert!(
+                PANEL_HTML.contains(field),
+                "页面读取的字段 `{field}` 在 panel.html 里找不到"
+            );
+        }
+        cleanup(&state);
     }
 
     /// 判据一：路径还是我们绑的那个 inode → 200 / owned: true。

@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>XiaoAI 控制台</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 24px; max-width: 760px; }
+  h1 { font-size: 18px; margin: 0 0 16px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+  label { display: block; font-size: 13px; color: #8889; margin-bottom: 4px; }
+  input[type=password] { flex: 1 1 260px; padding: 8px 10px; border: 1px solid #8884; border-radius: 8px; background: transparent; color: inherit; font: inherit; }
+  button { padding: 8px 14px; border: 1px solid #8884; border-radius: 8px; background: #8881; color: inherit; font: inherit; cursor: pointer; }
+  button:hover { background: #8882; }
+  .card { border: 1px solid #8884; border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; }
+  .k { color: #8889; font-size: 13px; }
+  .v { font-variant-numeric: tabular-nums; font-weight: 600; }
+  .ok { color: #17864a; } .bad { color: #c22a2a; }
+  pre { background: #8881; padding: 12px; border-radius: 8px; overflow: auto; font-size: 12px; margin: 0; }
+  .hint { color: #8889; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>XiaoAI 控制台 <span class="hint" id="who"></span></h1>
+
+<div class="row">
+  <div style="flex:1 1 260px">
+    <label for="token">server.token</label>
+    <input id="token" type="password" autocomplete="off" placeholder="agent.yaml 里的 server.token">
+  </div>
+  <button type="button" id="saveBtn">保存令牌</button>
+  <button type="button" id="refreshBtn">刷新状态</button>
+</div>
+
+<div class="card">
+  <div class="k">探活</div>
+  <div class="v" id="health">—</div>
+  <div class="k" id="healthWhy">填入令牌后自动刷新</div>
+</div>
+
+<div class="card">
+  <div class="k">原始响应</div>
+  <pre id="raw">—</pre>
+</div>
+
+<p class="hint">打开本页不需要令牌；令牌只存在本机浏览器，用于页面发出的 /health、/status 请求。<br>
+换 IP 或端口后需要重新填写（浏览器按 origin 隔离存储）。</p>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var timer = null;
+  var KEY = "xiaoai_token";
+
+  $("who").textContent = location.host;
+  $("token").value = localStorage.getItem(KEY) || "";
+
+  function token() { return ($("token").value || "").trim(); }
+
+  function describeError(status) {
+    if (status === 401) return "401 令牌未填或不正确";
+    if (status === 503) return "503 socket 不在本进程手里（语音链路异常）";
+    return String(status);
+  }
+
+  function get(path) {
+    return fetch(path, { headers: { Authorization: "Bearer " + token() } })
+      .then(function (r) {
+        return r.text().then(function (t) {
+          var body = null;
+          try { body = JSON.parse(t); } catch (e) { /* 非 JSON 给原文 */ }
+          return { status: r.status, body: body, text: t };
+        });
+      });
+  }
+
+  function render(h) {
+    var ok = h.status === 200;
+    var b = h.body || {};
+    var s = b.speech || {};
+    var so = b.socket || {};
+    $("health").textContent = ok ? "200 ok" : describeError(h.status);
+    $("health").className = "v " + (ok ? "ok" : "bad");
+    $("healthWhy").textContent =
+      "socket " + (so.owned ? "归本进程" : "不在本进程手里") +
+      " · 上次收包 " + (s.last_packet_age_s == null ? "从未" : s.last_packet_age_s + "s 前") +
+      " · 重启 " + (s.service_restarts == null ? "?" : s.service_restarts) + " 次" +
+      " · 运行 " + (b.uptime_s == null ? "?" : b.uptime_s) + "s";
+  }
+
+  function refresh() {
+    if (!token()) {
+      $("health").textContent = "未填令牌";
+      $("health").className = "v";
+      $("healthWhy").textContent = "填入 server.token 后点「保存令牌」";
+      stop();
+      return;
+    }
+    get("/health").then(function (h) {
+      render(h);
+      return get("/status").then(function (st) {
+        $("raw").textContent = JSON.stringify({ health: h.body, status: st.body }, null, 2);
+      });
+    }).catch(function (e) {
+      $("health").textContent = "请求失败";
+      $("health").className = "v bad";
+      $("healthWhy").textContent = String(e);
+    });
+  }
+
+  function start() {
+    if (timer) return;
+    timer = setInterval(refresh, 5000);
+  }
+
+  function stop() {
+    if (timer) { clearInterval(timer); timer = null; }
+  }
+
+  $("saveBtn").addEventListener("click", function () {
+    localStorage.setItem(KEY, token());
+    refresh();
+    start();
+  });
+  $("refreshBtn").addEventListener("click", refresh);
+
+  // 只有填了令牌才轮询：否则开着标签页过夜会每 5 秒打一条 401 把设备日志刷满。
+  if (token()) { refresh(); start(); }
+})();
+</script>
+</body>
+</html>
