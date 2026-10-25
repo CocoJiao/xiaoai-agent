@@ -123,6 +123,15 @@ tts:
   # 播放本地音频文件的命令模板（{path} 为占位符）。留空用内置默认值：
   # killall miplayer 2>/dev/null; miplayer -f {path} >/tmp/xiaoai-tts-player.log 2>&1 &
   # playback_command: null
+  # 外部 TTS 播放期间抑制采集（默认开）。miplayer 放的音频不在 pns 的回声消除
+  # 参考里：不抑制时 mic 会把答案本身当成用户说话（真机日志 end=max_duration，
+  # 随后 ASR 把答案转写回来，设备开始自问自答）。代价只有一个——播放中「不喊
+  # 唤醒词直接插话」失效；喊唤醒词打断不受影响（那是固件层判定的）。
+  suppress_capture_while_playing: true
+  # 播放结束后的余量：房间混响 + 播放器缓冲尾音
+  playback_tail_ms: 500
+  # 播放器启动/缓冲宽限：OH2P 1.62.2 实测 miplayer 从命令返回到出声约 3.2s
+  playback_startup_grace_ms: 3000
   # OpenAI 兼容的 /v1/audio/speech 后端：base_url 指向谁就是谁（官方/中转/局域网自建 shim）
   # 实测可用的后端：蚂蚁百灵（2026-10-25，OH2P 真机链路待验）
   #   base_url: https://api.ant-ling.com/v1

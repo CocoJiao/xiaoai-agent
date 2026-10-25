@@ -729,6 +729,18 @@ pub struct TtsConfig {
     /// 留 `None` 用内置默认值；写成字符串是为了让真机上的播放方式可换，
     /// 而不用重新编译（`miplayer` 与 `aplay` 在同一台机器上行为不同）。
     pub playback_command: Option<String>,
+    /// 外部 TTS 播放期间抑制采集。
+    ///
+    /// 外部播放走的 `miplayer` **不在 pns 的回声消除参考里**：mic 会把答案本身
+    /// 当成用户说话（真机日志：播放中出现 `CAPTURE_UTTERANCE ... end=max_duration`，
+    /// 紧接着 ASR 把答案转写回来，设备开始自问自答）。默认开；关掉等于把这个
+    /// 故障装回去。native provider 不受影响——它走 pns，AEC 认得自己的声音。
+    pub suppress_capture_while_playing: bool,
+    /// 播放结束之后的余量（房间混响 + 播放器缓冲尾音）。
+    pub playback_tail_ms: u64,
+    /// 播放器启动/缓冲宽限。实测 OH2P 1.62.2 的 `miplayer` 从命令返回到真正
+    /// 出声约 3.2s，只按音频时长开窗会漏掉这一段。
+    pub playback_startup_grace_ms: u64,
     /// OpenAI 兼容的 `/v1/audio/speech` 后端。`base_url` 指向谁就是谁：
     /// 官方、中转、局域网自建 shim 都是同一套协议，所以只有这一段。
     pub openai: OpenAiTtsConfig,
@@ -793,6 +805,9 @@ impl Default for TtsConfig {
             provider: TtsProvider::Native,
             fallback_to_native: true,
             playback_command: None,
+            suppress_capture_while_playing: true,
+            playback_tail_ms: 500,
+            playback_startup_grace_ms: 3_000,
             openai: OpenAiTtsConfig::default(),
         }
     }

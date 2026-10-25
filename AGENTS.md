@@ -163,6 +163,58 @@ A reply whose token expired mid-synthesis returns `Ok(())` and plays nothing: it
 was interrupted, not failed, so it must not count towards the consecutive-failure
 yield.
 
+## Suppressing Capture During External Playback
+
+`miplayer` output is **not** in pns's AEC reference. While an external TTS reply
+is sounding the microphone hears the answer itself, the local VAD calls it
+speech, and the capture runs to `max_utterance_s` (`end=max_duration`) before the
+ASR transcribes the agent's own words back as a user question. Measured on OH2P
+1.62.2: capture was requested 155 ms after synthesis finished, the follow-up
+stream opened 143 ms later, the first "speech" landed ~3.2 s after that (player
+startup + buffering), and the utterance ended at 14.7 s with `end=max_duration`.
+
+The fix is a **capture-side quiet window**; the `speech.usock` protocol sequence
+is unchanged.
+
+- `PlaybackGate` carries the window (`mute_mic_for` / `mic_muted` /
+  `settle_quiet_window`) next to the interrupt token. `begin()` — wake, and
+  `/stop` later — clears it: the wake branch already kills the player, so the
+  sound has stopped and keeping the mute on would swallow the user's next
+  sentence.
+- `capture.rs` drops PCM while the window is open (it never reaches the
+  collector, so no `SpeechEvent` is produced) and **holds the idle timeout**.
+  Holding it is load-bearing: `runtime.session_idle_timeout_s` defaults to 20 s,
+  shorter than a long reply, so a session would otherwise be killed mid-sentence.
+- The window closes on a **fact, not arithmetic**: the default playback command
+  truncates `/tmp/xiaoai-tts-player.log` on every start, so `EndReached` in that
+  file means the sentence finished. A watcher task polls it (200 ms; the device's
+  busybox does support `sleep 0.2`) and shrinks the window to
+  `tts.playback_tail_ms`. Until that signal arrives the window is a generous cap
+  (`grace + 2 × duration + 10 s`): a missed signal must degrade to "muted a bit
+  longer", never to "echo gets through".
+- Only **non-pns** playback mutes. `native` (`tts_play.sh`) and the fallback to
+  it go through pns, whose AEC knows its own output; muting there would discard
+  barge-in for nothing.
+- Duration comes from the WAV `data` chunk measured against the real file size,
+  not from the declared length field: backends emit streaming headers
+  (`0x7FFFFFFF`) and trusting them yields a multi-hour window.
+- `DEFAULT_PLAYBACK_COMMAND` and `PLAYER_LOG_PATH` must name the same file; a
+  test pins it because changing one silently degrades the window to the cap.
+- The window's `generation` makes a late end-signal from the previous reply a
+  no-op — otherwise it would close the *next* reply's window while that reply is
+  still sounding.
+
+What this deliberately gives up: **barge-in without the wake word**. That path is
+the one the echo polluted (every `end=max_duration` sample came from it). Keeping
+it needs real AEC — subtracting the known playback audio from the capture — not
+the absence of suppression; tracked in issue #33. Wake-word interruption is
+unaffected: it is decided by `mipns` in firmware and arrives as
+`Turn(activation=Wakeup)`, independent of whether the VAD is being fed.
+
+A config field added under `tts` stays hot-reloadable only because
+`classify_config_change` lists the whole section as `applied` — moving these
+fields into `device` or `capture` would make them restart-only.
+
 ## Control Plane Auth
 
 The local control plane (`server` section) is off by default and binds loopback
