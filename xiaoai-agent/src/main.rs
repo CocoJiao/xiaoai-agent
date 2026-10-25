@@ -595,6 +595,9 @@ async fn start_control_plane(
         Ok(task) => task,
         Err(err) => {
             error!("控制面启动失败（语音功能不受影响）: {err:#}");
+            // 进程不再退出，所以 `/health` 不会自己出现。必须显式说一句，
+            // 否则运维看到的是「connection refused」，会以为服务还没起来。
+            warn!("控制面已禁用：本机没有 /health 可用（改 agent.yaml 的 server 段并重启）");
             None
         }
     }
