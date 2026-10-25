@@ -125,9 +125,30 @@ impl TtsRouter {
         // begin() 一次，这里在真正出声前发现自己过期，于是闭嘴而不是补播一句。
         let token = self.gate.current();
         match config.provider {
-            TtsProvider::Native => self.device.speak(text).await,
+            TtsProvider::Native => {
+                // native 没有「几百毫秒合成」的窗口，但 `tts_play.sh` 起播本身也有延迟，
+                // 且这里必须和外部路径共用同一道闸——结构上不能留例外。
+                if !self.may_play(token) {
+                    return Ok(());
+                }
+                self.device.speak(text).await
+            }
             provider => self.speak_remote(config, provider, text, token).await,
         }
+    }
+
+    /// 起播前的最后一道闸：令牌过期就闭嘴。返回 `true` = 可以出声。
+    ///
+    /// 注意语义是「该不该播」，不是「有没有失败」——被打断不是失败，调用方返回
+    /// `Ok(())`。**所有出声路径都必须过这里**（native、外部合成、失败回退、将来的
+    /// `/play/*`），否则会出现「有的路径查、有的不查」的口子：复核指出的正是
+    /// 「外部 TTS 超时 → 回退 native」这条最容易被用户打断的路。
+    fn may_play(&self, token: u64) -> bool {
+        if self.gate.is_active(token) {
+            return true;
+        }
+        debug!("本轮回答在打断后已过期，跳过起播");
+        false
     }
 
     async fn speak_remote(
@@ -147,6 +168,11 @@ impl TtsRouter {
             Err(err) if config.fallback_to_native => {
                 // 音色会变，但「能说话」比「音色统一」重要。
                 warn!(?provider, error = %err, "外部 TTS 失败，回退系统 TTS");
+                // 回退也是一次起播，同样要过闸：外部超时 + 用户已经不耐烦地喊了第二次，
+                // 是最容易撞上的组合；不过闸就会在失败之后补一句迟到的话。
+                if !self.may_play(token) {
+                    return Ok(());
+                }
                 self.device.speak(text).await
             }
             Err(err) => Err(err.context(format!(
@@ -165,17 +191,17 @@ impl TtsRouter {
         let path = speech_output_path(&tts.dir(), &tts.response_format);
         let bytes = self.fetch_openai_speech(tts, text).await?;
 
-        // 合成这一步可能要几百毫秒到几秒：期间用户可能已经喊了唤醒词。
-        // 这时候**不要**再出声——旧行为是照样播完，用户听到的是「他已经问下一句了，
-        // 音箱还在念上一句的答案」。
-        if !self.gate.is_active(token) {
-            debug!("本轮回答在合成期间被打断，跳过播放");
-            return Ok(());
-        }
         tokio::fs::write(&path, &bytes)
             .await
             .with_context(|| format!("写音频文件失败: {}", path.display()))?;
         debug!(bytes = bytes.len(), path = %path.display(), "TTS 音频已落盘");
+
+        // 闸放在落盘**之后**：合成可能要几百毫秒到几秒，期间用户完全可能已经喊了
+        // 唤醒词。放在 fetch 之后、write 之前也挡得住，但那样会白写一次几十到几百 KB；
+        // 放在这里，检查到起播之间只剩同步的模板渲染（TOCTOU 从毫秒级压到微秒级）。
+        if !self.may_play(token) {
+            return Ok(());
+        }
 
         let template = config
             .playback_command
@@ -476,19 +502,24 @@ mod tests {
 
     /// 合成期间被打断（用户喊了唤醒词）→ **不播**，但也不算失败。
     ///
-    /// 这条钉的是「说了闭嘴还多播一句」那个体感：旧代码在这里照样把音频交给播放器。
+    /// 时序用 oneshot 握手而不是 sleep：假后端收到请求后卡住，测试确认「请求已经发出」
+    /// 才去打断，然后放行响应。这样「打断一定发生在合成完成之前」是构造出来的，
+    /// 不依赖 300ms/100ms 这种相对时间窗（CI 上一次链接抖动就能让它偶发翻车）。
     #[tokio::test]
     async fn a_reply_interrupted_during_synthesis_is_not_played() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
 
-        // 慢后端：300ms 后才回音频，留出「合成期间被打断」的窗口。
         tokio::spawn(async move {
             if let Ok((mut socket, _)) = listener.accept().await {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = [0_u8; 4096];
                 let _ = socket.read(&mut buf).await;
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                let _ = request_tx.send(()); // 「请求已到，合成中」
+                let _ = release_rx.await; // 等测试先打断
                 let body = b"RIFFfake-wav";
                 let nl = crlf();
                 let head = format!("HTTP/1.1 200 OK{nl}Content-Length: {}{nl}{nl}", body.len());
@@ -500,7 +531,6 @@ mod tests {
         let shell = Arc::new(RecordingShell::always_ok());
         let gate = Arc::new(PlaybackGate::default());
         let router = router_with_gate(shell.clone(), gate.clone());
-
         let config = TtsConfig {
             provider: TtsProvider::OpenAi,
             openai: OpenAiTtsConfig {
@@ -513,18 +543,79 @@ mod tests {
             ..TtsConfig::default()
         };
 
-        // 100ms 后「用户喊了唤醒词」。
-        let interrupter = gate.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            interrupter.begin();
-        });
+        let speaking =
+            tokio::spawn(async move { router.speak(&config, "这句不该被念出来").await });
+        request_rx.await.expect("假后端应当先收到请求");
+        gate.begin(); // 合成中，用户喊了唤醒词
+        release_tx.send(()).expect("放行响应");
+        speaking
+            .await
+            .expect("speak 任务不该 panic")
+            .expect("被打断不是失败");
 
-        router.speak(&config, "这句不该被念出来").await.unwrap();
         assert_eq!(
             shell.count_matching("miplayer"),
             0,
             "合成期间被打断时不能再去起播放器"
+        );
+    }
+
+    /// 复核 P2 的现场：外部 TTS 失败/超时 + 用户已经喊了第二次 → **回退也不许出声**。
+    ///
+    /// 这条比 openai 那条更容易被真实用户撞上：外部超时往往要等好几秒，用户早就
+    /// 不耐烦地又喊了一声。回退是 catch 里新起的动作，很容易被漏掉不查令牌。
+    #[tokio::test]
+    async fn a_fallback_after_an_interrupt_stays_silent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0_u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let _ = request_tx.send(());
+                let _ = release_rx.await;
+                // 500 → 触发 fallback_to_native
+                let nl = crlf();
+                let head =
+                    format!("HTTP/1.1 500 Internal Server Error{nl}Content-Length: 0{nl}{nl}");
+                let _ = socket.write_all(head.as_bytes()).await;
+            }
+        });
+
+        let shell = Arc::new(RecordingShell::always_ok());
+        let gate = Arc::new(PlaybackGate::default());
+        let router = router_with_gate(shell.clone(), gate.clone());
+        let config = TtsConfig {
+            provider: TtsProvider::OpenAi,
+            fallback_to_native: true,
+            openai: OpenAiTtsConfig {
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                api_key: "sk-test".to_string(),
+                timeout_s: 5.0,
+                output_dir: Some(std::env::temp_dir()),
+                ..OpenAiTtsConfig::default()
+            },
+            ..TtsConfig::default()
+        };
+
+        let speaking = tokio::spawn(async move { router.speak(&config, "不许补播这一句").await });
+        request_rx.await.expect("假后端应当先收到请求");
+        gate.begin(); // 用户喊了第二次
+        release_tx.send(()).expect("放行 500 响应");
+        speaking
+            .await
+            .expect("speak 不该 panic")
+            .expect("被打断不是失败");
+
+        assert_eq!(
+            shell.count_matching("/usr/sbin/tts_play.sh"),
+            0,
+            "被打断之后，失败回退也不能出声（否则就是「迟到的一句」）"
         );
     }
 

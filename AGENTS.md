@@ -147,12 +147,17 @@ Rules:
 Interrupting speech needs **both** halves; either one alone produces the bug the
 user actually notices ("I said stop and it read out one more sentence"):
 
-- `PlaybackGate` (`tts.rs`) — a monotonic token. A new wake / `/stop` / next turn
-  calls `begin()`, and every synthesis step checks `is_active(captured_token)`
-  before it starts playing. This stops work that has **not** started yet.
+- `PlaybackGate` (`tts.rs`) — a monotonic token. Today only the wake branch calls
+  `begin()`; `/stop` and per-sentence streaming are the next step, and this list
+  must not pretend otherwise. Every path that can start audio — native, remote
+  synthesis, and the remote→native fallback — goes through `may_play(token)`
+  first. This stops work that has **not** started yet.
 - `device.abort_current_output()` — kills `tts_play.sh` / `miplayer`, which are
   separate processes. `task.abort()` only drops the future; the audio plays on.
-  This stops the sentence that is **already** sounding.
+  This stops the sentence that is **already** sounding. When music was only
+  paused/ducked, kill `tts_play.sh` alone instead: `killall miplayer` would take
+  the paused music with it. Known gap in that case — a reply synthesized through
+  `miplayer` finishes on its own (music is off by default).
 
 A reply whose token expired mid-synthesis returns `Ok(())` and plays nothing: it
 was interrupted, not failed, so it must not count towards the consecutive-failure
