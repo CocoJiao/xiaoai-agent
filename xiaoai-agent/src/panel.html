@@ -3,130 +3,623 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>XiaoAI 控制台</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 24px; max-width: 760px; }
-  h1 { font-size: 18px; margin: 0 0 16px; }
-  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
-  label { display: block; font-size: 13px; color: #8889; margin-bottom: 4px; }
-  input[type=password] { flex: 1 1 260px; padding: 8px 10px; border: 1px solid #8884; border-radius: 8px; background: transparent; color: inherit; font: inherit; }
-  button { padding: 8px 14px; border: 1px solid #8884; border-radius: 8px; background: #8881; color: inherit; font: inherit; cursor: pointer; }
-  button:hover { background: #8882; }
-  .card { border: 1px solid #8884; border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; }
-  .k { color: #8889; font-size: 13px; }
-  .v { font-variant-numeric: tabular-nums; font-weight: 600; }
-  .ok { color: #17864a; } .bad { color: #c22a2a; }
-  pre { background: #8881; padding: 12px; border-radius: 8px; overflow: auto; font-size: 12px; margin: 0; }
-  .hint { color: #8889; font-size: 13px; }
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f5;
+    --card: #ffffff;
+    --line: rgba(0, 0, 0, .10);
+    --line-strong: rgba(0, 0, 0, .20);
+    --fg: #1a1f1c;
+    --fg-2: #5c6762;
+    --fg-3: #8b9590;
+    --ok: #0f7a52;
+    --warn: #9a5b0b;
+    --bad: #a52a2a;
+    --idle: #6d7671;
+    --ok-bg: #eaf6f0;
+    --warn-bg: #fdf3e3;
+    --bad-bg: #fbeceb;
+    --idle-bg: #eef0ef;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121614;
+      --card: #1b201e;
+      --line: rgba(255, 255, 255, .10);
+      --line-strong: rgba(255, 255, 255, .22);
+      --fg: #e9eeeb;
+      --fg-2: #9fa9a4;
+      --fg-3: #6f7975;
+      --ok: #5dcaa5;
+      --warn: #efb05e;
+      --bad: #f09595;
+      --idle: #98a29d;
+      --ok-bg: #152b23;
+      --warn-bg: #2b2416;
+      --bad-bg: #2b1717;
+      --idle-bg: #1f2523;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 26px 20px 32px;
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; }
+
+  .top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+  h1 { font-size: 16px; font-weight: 600; margin: 0; letter-spacing: -.01em; }
+  .host { font-family: var(--mono); font-size: 12px; color: var(--fg-3); }
+
+  .verdict {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    flex-wrap: wrap;
+    padding: 18px 20px;
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    background: var(--tone-bg, var(--idle-bg));
+    transition: background .2s ease;
+  }
+  .verdict[data-tone="idle"]     { --tone: var(--idle); --tone-bg: var(--idle-bg); }
+  .verdict[data-tone="warn"]     { --tone: var(--warn); --tone-bg: var(--warn-bg); }
+  .verdict[data-tone="bad"]      { --tone: var(--bad);  --tone-bg: var(--bad-bg); }
+  .verdict[data-tone="ok"]       { --tone: var(--ok);   --tone-bg: var(--ok-bg); }
+  .verdict[data-tone="ok-quiet"] { --tone: var(--ok);   --tone-bg: var(--ok-bg); }
+
+  .dot {
+    width: 12px; height: 12px; flex: none;
+    margin-top: 7px;
+    border-radius: 50%;
+    border: 2px solid var(--tone, var(--idle));
+    background: var(--tone, var(--idle));
+    transition: background .2s ease, border-color .2s ease;
+  }
+  .verdict[data-tone="ok-quiet"] .dot { background: transparent; }
+
+  .vtext { flex: 1 1 240px; min-width: 0; }
+  .vtitle { margin: 0; font-size: 21px; font-weight: 600; line-height: 1.32; letter-spacing: -.01em; }
+  .vdetail { margin: 6px 0 0; font-size: 13px; line-height: 1.55; color: var(--fg-2); }
+  .vacts { display: flex; gap: 6px; margin-left: auto; }
+
+  .btn {
+    font: inherit; font-size: 12.5px;
+    padding: 6px 12px;
+    border: 1px solid var(--line-strong);
+    border-radius: 9px;
+    background: transparent;
+    color: var(--fg-2);
+    cursor: pointer;
+  }
+  .btn:hover { background: rgba(0, 0, 0, .05); color: var(--fg); }
+  .btn:focus-visible { outline: 2px solid var(--ok); outline-offset: 2px; }
+  .btn:disabled, .btn:disabled:hover { opacity: .4; cursor: default; background: transparent; color: var(--fg-3); }
+
+  .facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+  .fact { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+  .fact dt { font-size: 11.5px; color: var(--fg-3); margin-bottom: 5px; }
+  .fact dd { margin: 0; font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+  /* 绝对时刻：排障时要拿它去和 agent.log 对时间，相对时长对不上。 */
+  .fact dd .sub { display: block; margin-top: 3px; font-size: 11px; font-weight: 400; letter-spacing: 0; color: var(--fg-3); }
+
+  details.fold {
+    margin-top: 12px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  summary {
+    display: flex; align-items: center; gap: 8px;
+    padding: 12px 16px;
+    font-size: 13.5px; color: var(--fg-2);
+    cursor: pointer;
+    list-style: none;
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary::before {
+    content: ""; flex: none;
+    width: 0; height: 0;
+    border-left: 5px solid var(--fg-3);
+    border-top: 4px solid transparent;
+    border-bottom: 4px solid transparent;
+    transition: transform .15s ease;
+  }
+  details[open] summary::before { transform: rotate(90deg); }
+  summary:focus-visible { outline: 2px solid var(--ok); outline-offset: -2px; }
+  .count { margin-left: auto; font-size: 11.5px; color: var(--fg-3); font-variant-numeric: tabular-nums; }
+  .foldbody { padding: 0 16px 14px; }
+
+  .diag { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px 14px; margin: 0 0 12px; font-size: 12.5px; }
+  .diag dt { color: var(--fg-3); }
+  .diag dd { margin: 0; font-family: var(--mono); font-size: 12px; word-break: break-all; }
+
+  pre.raw {
+    margin: 0;
+    padding: 12px;
+    background: var(--idle-bg);
+    border-radius: 10px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--fg-2);
+    overflow: auto;
+    max-height: 240px;
+  }
+
+  .tokrow { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 9px; }
+  .tokrow input {
+    flex: 1 1 220px; min-width: 0;
+    font: inherit; font-size: 13px;
+    padding: 9px 11px;
+    border: 1px solid var(--line-strong);
+    border-radius: 10px;
+    background: var(--bg);
+    color: var(--fg);
+  }
+  .tokrow input:focus-visible { outline: 2px solid var(--ok); outline-offset: 1px; }
+  .hint { margin: 0; font-size: 12px; line-height: 1.55; color: var(--fg-3); }
+
+  footer.foot {
+    display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+    margin-top: 14px;
+    font-size: 11.5px;
+    color: var(--fg-3);
+  }
+
+  @media (max-width: 520px) {
+    body { padding: 18px 14px 26px; }
+    .vtitle { font-size: 18px; }
+    .vacts { width: 100%; margin-left: 0; }
+    .facts { grid-template-columns: 1fr; gap: 8px; }
+    .fact { display: flex; justify-content: space-between; align-items: baseline; padding: 11px 13px; }
+    .fact dt { margin-bottom: 0; font-size: 12.5px; }
+    .fact dd { font-size: 16px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
 </style>
 </head>
 <body>
-<h1>XiaoAI 控制台 <span class="hint" id="who"></span></h1>
+<main class="wrap">
 
-<div class="row">
-  <div style="flex:1 1 260px">
-    <label for="token">server.token</label>
-    <input id="token" type="password" autocomplete="off" placeholder="agent.yaml 里的 server.token">
+  <div class="top">
+    <h1>XiaoAI 控制台</h1>
+    <span class="host" id="host"></span>
   </div>
-  <button type="button" id="saveBtn">保存令牌</button>
-  <button type="button" id="refreshBtn">刷新状态</button>
-</div>
 
-<div class="card">
-  <div class="k">探活</div>
-  <div class="v" id="health">—</div>
-  <div class="k" id="healthWhy">填入令牌后自动刷新</div>
-</div>
+  <section class="verdict" id="verdict" data-tone="idle">
+    <span class="dot" aria-hidden="true"></span>
+    <div class="vtext">
+      <p class="vtitle" id="vtitle" aria-live="polite">正在读取状态</p>
+      <p class="vdetail" id="vdetail" aria-live="off">页面自身不需要令牌，读状态需要。</p>
+    </div>
+    <div class="vacts">
+      <button type="button" class="btn" id="toggleBtn">暂停</button>
+      <button type="button" class="btn" id="refreshBtn">刷新</button>
+    </div>
+  </section>
 
-<div class="card">
-  <div class="k">原始响应</div>
-  <pre id="raw">—</pre>
-</div>
+  <dl class="facts">
+    <div class="fact"><dt>已运行</dt><dd id="fUptime">—</dd></div>
+    <div class="fact"><dt>上次收包</dt><dd><span id="fPacket">—</span><span class="sub" id="fPacketAt"></span></dd></div>
+    <div class="fact"><dt>异常重启</dt><dd id="fRestarts">—</dd></div>
+  </dl>
 
-<p class="hint">打开本页不需要令牌；令牌只存在本机浏览器，用于页面发出的 /health、/status 请求。<br>
-换 IP 或端口后需要重新填写（浏览器按 origin 隔离存储）。</p>
+  <details class="fold" id="diagFold">
+    <summary>诊断与原始数据<span class="count" id="diagCount">—</span></summary>
+    <div class="foldbody">
+      <dl class="diag">
+        <div><dt>socket</dt><dd id="dSocket">—</dd></div>
+        <div><dt>归属</dt><dd id="dOwned">—</dd></div>
+        <div><dt>pid</dt><dd id="dPid">—</dd></div>
+        <div><dt>配置文件</dt><dd id="dConfig">—</dd></div>
+        <div><dt>本次往返</dt><dd id="dRtt">—</dd></div>
+      </dl>
+      <pre class="raw" id="raw">—</pre>
+    </div>
+  </details>
+
+  <details class="fold" id="tokenFold">
+    <summary>访问令牌<span class="count" id="tokenState">未设置</span></summary>
+    <div class="foldbody">
+      <div class="tokrow">
+        <input id="token" type="password" autocomplete="off" spellcheck="false" aria-label="访问令牌" placeholder="填 agent.yaml 里 server 段的 token">
+        <button type="button" class="btn" id="saveBtn">保存</button>
+        <button type="button" class="btn" id="clearBtn">清除</button>
+      </div>
+      <p class="hint">只存在这台浏览器里。换 IP 或端口要重填 —— 按 origin 隔离，不是存在设备上。</p>
+    </div>
+  </details>
+
+  <footer class="foot">
+    <span id="footState">—</span>
+    <span id="footRight">尚无数据</span>
+  </footer>
+
+  <noscript><p class="hint">这个页面需要 JavaScript 才能读取状态。</p></noscript>
+</main>
 
 <script>
 (function () {
-  var $ = function (id) { return document.getElementById(id); };
-  var timer = null;
+  "use strict";
+
   var KEY = "xiaoai_token";
+  var BASE_MS = 5000;
+  var QUIET_S = 600;
+  var STALE_AFTER = 3;
+  var BAD_TOKEN_MS = 30000;
+  var TIMEOUT_MS = 4000;
+  var FOOT_IDLE = "刷新间隔 5 秒 · 标签页隐藏时自动暂停";
 
-  $("who").textContent = location.host;
-  $("token").value = localStorage.getItem(KEY) || "";
+  var $ = function (id) { return document.getElementById(id); };
 
-  function token() { return ($("token").value || "").trim(); }
+  var run = { timer: null, failures: 0, lastOkAt: 0, paused: false, busy: false, nextDelay: BASE_MS, noAuth: false, lost: 0 };
+  var snapshot = null;
 
-  function describeError(status) {
-    if (status === 401) return "401 令牌未填或不正确";
-    if (status === 503) return "503 socket 不在本进程手里（语音链路异常）";
-    return String(status);
+  // 七态。判定顺序即「先修最小的事」：令牌是本地问题，链路是设备问题。
+  var S = {
+    AUTH_MISSING: { tone: "idle", title: "还没填访问令牌", detail: "展开下面的「访问令牌」填一次，之后就记在这台浏览器里。" },
+    NO_AUTH:      { tone: "warn", title: "在线，但没启用鉴权", detail: "server.token 为空且只绑回环：本机（或隧道过来）能读，其他主机连不上。要绑内网地址必须先设 token，否则控制面会拒绝启动。" },
+    UNREACHABLE:  { tone: "warn", title: "连不上控制面", detail: "地址端口不对，或 agent.yaml 里 server.enabled 是 false。语音链路不受影响。" },
+    AUTH_BAD:     { tone: "warn", title: "令牌被拒（401）", detail: "和 agent.yaml 的 server.token 不一致，重新粘贴一次。" },
+    SOCKET_LOST:  { tone: "bad",  title: "麦克风被抢回（503）", detail: "进程还活着，但 speech.usock 已经不归它了。需要在设备上执行 start-agent.sh restart。" },
+    OK_LIVE:      { tone: "ok",       title: "在线", detail: "" },
+    OK_QUIET:     { tone: "ok-quiet", title: "在线 · 静默", detail: "" },
+    STALE:        { tone: "idle", title: "数据已过期", detail: "" }
+  };
+
+  function token() {
+    return ($("token").value || "").trim();
   }
 
+  function dur(seconds) {
+    if (seconds === null || seconds === undefined || isNaN(seconds)) return "—";
+    var s = Math.max(0, Math.round(Number(seconds)));
+    if (s < 60) return s + " 秒";
+    if (s < 3600) {
+      var m = Math.floor(s / 60), rs = s % 60;
+      return rs ? m + " 分 " + rs + " 秒" : m + " 分";
+    }
+    if (s < 86400) {
+      var h = Math.floor(s / 3600), rh = Math.floor((s % 3600) / 60);
+      return rh ? h + " 小时 " + rh + " 分" : h + " 小时";
+    }
+    var d = Math.floor(s / 86400), rd = Math.floor((s % 86400) / 3600);
+    return rd ? d + " 天 " + rd + " 小时" : d + " 天";
+  }
+
+  function clock(ms) {
+    var d = new Date(ms), now = new Date();
+    var pad = function (n) { return n < 10 ? "0" + n : String(n); };
+    var hms = pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+    // 「数据时刻 22:10:03」可能是昨晚的，跨天必须带日期。
+    var sameDay = d.getFullYear() === now.getFullYear()
+      && d.getMonth() === now.getMonth()
+      && d.getDate() === now.getDate();
+    return sameDay ? hms : (pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " + hms);
+  }
+
+  // 不靠浏览器文案匹配：Chrome 是 "Failed to fetch"，Safari 是 "Load failed"，
+  // Firefox 是 "NetworkError when attempting to fetch resource"——按类型判才跨浏览器。
+  function netReason(err) {
+    if (!err) return "无响应";
+    if (err.name === "AbortError") return "请求超时";
+    if (err.name === "TypeError") return "无法建立连接";
+    return "网络错误";
+  }
+
+  // 只读 GET；带 Bearer，不把令牌放进 URL（历史、反代日志、Referer 都会留痕）。
   function get(path) {
-    return fetch(path, { headers: { Authorization: "Bearer " + token() } })
-      .then(function (r) {
-        return r.text().then(function (t) {
-          var body = null;
-          try { body = JSON.parse(t); } catch (e) { /* 非 JSON 给原文 */ }
-          return { status: r.status, body: body, text: t };
-        });
+    var opts = { headers: { Authorization: "Bearer " + token() }, cache: "no-store" };
+    var ctl = null, tid = null;
+    if (window.AbortController) {
+      ctl = new AbortController();
+      opts.signal = ctl.signal;
+      tid = setTimeout(function () { ctl.abort(); }, TIMEOUT_MS);
+    }
+    var done = function () { if (tid) { clearTimeout(tid); tid = null; } };
+    return fetch(path, opts).then(function (res) {
+      return res.text().then(function (text) {
+        done();
+        var body = null;
+        try { body = JSON.parse(text); } catch (e) { body = null; }
+        return { status: res.status, body: body, text: text };
       });
+    }, function (err) { done(); throw err; });
   }
 
-  function render(h) {
-    var ok = h.status === 200;
-    var b = h.body || {};
-    var s = b.speech || {};
-    var so = b.socket || {};
-    $("health").textContent = ok ? "200 ok" : describeError(h.status);
-    $("health").className = "v " + (ok ? "ok" : "bad");
-    $("healthWhy").textContent =
-      "socket " + (so.owned ? "归本进程" : "不在本进程手里") +
-      " · 上次收包 " + (s.last_packet_age_s == null ? "从未" : s.last_packet_age_s + "s 前") +
-      " · 重启 " + (s.service_restarts == null ? "?" : s.service_restarts) + " 次" +
-      " · 运行 " + (b.uptime_s == null ? "?" : b.uptime_s) + "s";
+  function render(key, detail) {
+    var s = S[key] || S.UNREACHABLE;
+    $("verdict").setAttribute("data-tone", s.tone);
+    // 只有文字真的变了才写：live region 里每 5 秒重写一次同样的字，部分读屏会重复播报。
+    if ($("vtitle").textContent !== s.title) {
+      $("vtitle").textContent = s.title;
+      document.title = s.title + " · XiaoAI 控制台";
+    }
+    var text = (detail === undefined) ? s.detail : detail;
+    if ($("vdetail").textContent !== text) $("vdetail").textContent = text;
+    // 没有可轮询的东西时，「暂停」留着只会让人以为点了有用。
+    $("toggleBtn").disabled = !token() && !run.noAuth;
   }
 
-  function refresh() {
-    if (!token()) {
-      $("health").textContent = "未填令牌";
-      $("health").className = "v";
-      $("healthWhy").textContent = "填入 server.token 后点「保存令牌」";
-      stop();
+  // 用最近一次成功的数据填格子：过期时保留旧值，但结论条已经说明它过期了。
+  function paint(health, status, rtt) {
+    // 只有真正的 health 载荷才覆盖快照：401 的 body 是 {"error":"unauthorized"}，
+    // 用它覆盖会把三张事实卡清成「—」，看着像设备挂了（其实只是令牌错了）。
+    if (health && health.body && health.body.socket) {
+      snapshot = { health: health.body, status: (status && status.body) || null, rtt: rtt, at: Date.now() };
+    }
+    var hb = snapshot ? snapshot.health : {};
+    var sb = (snapshot && snapshot.status) || {};
+    var sp = hb.speech || {};
+    var so = hb.socket || {};
+    var hasSnap = !!snapshot;
+    var age = sp.last_packet_age_s;
+
+    $("fUptime").textContent = hasSnap ? dur(hb.uptime_s) : "—";
+    // 没有数据时说「—」，只有接口真的给了 null 才是「从未收到过」。
+    $("fPacket").textContent = !hasSnap ? "—"
+      : ((age === null || age === undefined) ? "从未" : dur(age) + "前");
+    $("fPacketAt").textContent = (hasSnap && age !== null && age !== undefined)
+      ? clock(snapshot.at - age * 1000) : "";
+    $("fRestarts").textContent = (hasSnap && sp.service_restarts !== null && sp.service_restarts !== undefined)
+      ? sp.service_restarts + " 次" : "—";
+
+    $("dSocket").textContent = so.path || "—";
+    $("dOwned").textContent = so.owned === true ? "归本进程" : (so.owned === false ? "不在本进程" : "未知");
+    $("dPid").textContent = (sb.pid === null || sb.pid === undefined) ? "—" : String(sb.pid);
+    $("dConfig").textContent = sb.config || "—";
+    $("dRtt").textContent = (snapshot && snapshot.rtt !== null && snapshot.rtt !== undefined)
+      ? snapshot.rtt + " ms（页面侧计时）" : "—";
+
+    $("raw").textContent = snapshot
+      ? JSON.stringify({ health: snapshot.health, status: snapshot.status }, null, 2)
+      : "—";
+    $("footRight").textContent = snapshot ? ("数据时刻 " + clock(snapshot.at)) : "尚无数据";
+  }
+
+  function accept(health, status, rtt) {
+    var key, detail;
+    var h = health || { status: 0, body: null };
+    var age = null;
+
+    if (!h.status) {
+      // 传输层失败与令牌无关，先判它：否则「没令牌」会把「连不上」盖住。
+      key = "UNREACHABLE";
+      detail = S.UNREACHABLE.detail + "（" + netReason(h.error) + "）";
+    } else if (h.status === 401) {
+      if (token()) {
+        key = "AUTH_BAD";
+      } else {
+        key = "AUTH_MISSING";
+        detail = "这台设备要求令牌。展开下面的「访问令牌」填一次，之后就记在这台浏览器里。";
+      }
+    } else if (h.status === 503) {
+      key = "SOCKET_LOST";
+    } else if (h.status === 200 && h.body && h.body.status === "ok") {
+      age = (h.body.speech && h.body.speech.last_packet_age_s !== undefined)
+        ? h.body.speech.last_packet_age_s : null;
+      if (age === null || age === undefined) {
+        key = "OK_QUIET";
+        detail = "启动以来还没收到过音频包。";
+      } else if (age > QUIET_S) {
+        key = "OK_QUIET";
+        detail = "已经 " + dur(age) + " 没有声音。没人说话时没有音频包，这不算故障。";
+      } else {
+        key = "OK_LIVE";
+        detail = dur(age) + "前听到过声音。";
+      }
+      // 不带令牌也拿到了 200：服务端 token 为空（control-api.md 里「回环不鉴权」那种）。
+      // 这时不该继续要令牌，但也不该假装没事——控制面是敞开的。
+      if (!token()) {
+        key = "NO_AUTH";
+        detail = S.NO_AUTH.detail;
+      }
+    } else {
+      key = "UNREACHABLE";
+      detail = "控制面返回 HTTP " + h.status + "，页面不认识这个响应。";
+    }
+
+    // 只有「根本拿不到答复」才退避与判过期；503/401 是设备给的明确答复，5 秒照常看它恢复。
+    if (key === "UNREACHABLE") {
+      run.failures += 1;
+      // 指数从 failures-1 起才是 5→10→20→40→60；原来的 2^failures 第一次就等 10 秒。
+      run.nextDelay = Math.min(BASE_MS * Math.pow(2, run.failures - 1), 60000);
+    } else {
+      run.failures = 0;
+      run.nextDelay = (key === "AUTH_BAD" || key === "AUTH_MISSING") ? BAD_TOKEN_MS : BASE_MS;
+    }
+
+    // 一直 503 和刚 503 的处置完全不同：前者基本该重启了，得把持续时间说出来。
+    run.lost = (key === "SOCKET_LOST") ? run.lost + 1 : 0;
+    if (key === "SOCKET_LOST" && run.lost >= 3) {
+      detail = "已连续 " + run.lost + " 次（约 " + dur(run.lost * (BASE_MS / 1000))
+        + "）没能拿回麦克风。先在设备上执行 start-agent.sh restart。";
+    }
+
+    if (key !== "UNREACHABLE" && key !== "AUTH_BAD" && key !== "AUTH_MISSING") {
+      run.lastOkAt = Date.now();
+    }
+    // 服务端要不要令牌，由响应本身说了算——它决定「没令牌时还能不能继续轮询」。
+    if (key === "AUTH_MISSING" || key === "AUTH_BAD") {
+      run.noAuth = false;
+    } else if (!token() && key !== "UNREACHABLE") {
+      run.noAuth = true;
+    }
+
+    if (run.failures >= STALE_AFTER) {
+      // 和页脚的「数据时刻」取同一个来源：snapshot.at。原来一个用 run.lastOkAt，
+      // 同一屏会并排出现差几秒的两个时刻。
+      var dataAt = (snapshot && snapshot.at) ? snapshot.at : run.lastOkAt;
+      var tail = dataAt
+        ? ("下面的数字是 " + clock(dataAt) + " 的。")
+        : "还没有成功读到过状态。";
+      render("STALE", "已连续 " + run.failures + " 次没拿到数据（" + netReason(h.error) + "）。" + tail);
+    } else {
+      render(key, detail);
+    }
+
+    paint(health, status, rtt);
+
+    if (!token() && !run.noAuth) {
+      $("footState").textContent = "没填令牌，不会向设备发请求";
+    } else if (run.nextDelay === BASE_MS) {
+      $("footState").textContent = FOOT_IDLE;
+    } else {
+      $("footState").textContent = "下次刷新 " + Math.round(run.nextDelay / 1000) + " 秒后";
+    }
+  }
+
+  // probeOnly：没存令牌时只探一次 /health，用来分辨「服务端要令牌」还是「服务端根本没配令牌」。
+  // 只发一次、不进轮询，所以「开着标签页过夜刷 401」这个顾虑仍然成立。
+  function poll(probeOnly) {
+    if (run.busy) return;
+    run.busy = true;
+    var t0 = (window.performance && performance.now) ? performance.now() : Date.now();
+    var done = function () { run.busy = false; schedule(); };
+
+    // 两个请求并发：串行的话最坏要 8 秒（各 4 秒超时），页脚写的「5 秒」就成了假话。
+    var healthP = get("/health").then(function (h) { return h; }, function (err) {
+      return { status: 0, body: null, error: err };
+    });
+
+    if (probeOnly) {
+      healthP.then(function (h) { accept(h, null, null); }).then(done, done);
       return;
     }
-    get("/health").then(function (h) {
-      render(h);
-      return get("/status").then(function (st) {
-        $("raw").textContent = JSON.stringify({ health: h.body, status: st.body }, null, 2);
-      });
-    }).catch(function (e) {
-      $("health").textContent = "请求失败";
-      $("health").className = "v bad";
-      $("healthWhy").textContent = String(e);
-    });
+
+    var statusP = get("/status").then(function (st) { return st; }, function () { return null; });
+    Promise.all([healthP, statusP]).then(function (pair) {
+      var rtt = (window.performance && performance.now) ? Math.round(performance.now() - t0) : null;
+      accept(pair[0], pair[1], rtt);
+    }).then(done, done);
   }
 
-  function start() {
-    if (timer) return;
-    timer = setInterval(refresh, 5000);
+  function schedule() {
+    clearTimeout(run.timer);
+    run.timer = null;
+    // 没有令牌且服务端要令牌时，一个请求都不排——否则过夜就是一万多条 401。
+    if (run.paused || document.hidden) return;
+    if (!token() && !run.noAuth) return;
+    run.timer = setTimeout(tick, run.nextDelay);
   }
 
-  function stop() {
-    if (timer) { clearInterval(timer); timer = null; }
+  function tick() {
+    if (run.paused || document.hidden) return;
+    if (!token() && !run.noAuth) return;
+    poll();
   }
+
+  function stopPolling() {
+    clearTimeout(run.timer);
+    run.timer = null;
+  }
+
+  // 没有 <form>（CSP form-action 'none'），回车必须自己接，否则贴完令牌下意识敲回车没反应。
+  $("token").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      $("saveBtn").click();
+    }
+  });
 
   $("saveBtn").addEventListener("click", function () {
-    localStorage.setItem(KEY, token());
-    refresh();
-    start();
+    var value = token();
+    if (!value) {
+      $("token").focus();
+      return;
+    }
+    try { localStorage.setItem(KEY, value); } catch (e) { /* 隐私模式下存不进去，本次会话仍可用 */ }
+    $("tokenState").textContent = "已保存";
+    $("tokenFold").open = false;
+    run.failures = 0;
+    run.lost = 0;
+    run.noAuth = false;
+    run.nextDelay = BASE_MS;
+    poll();
   });
-  $("refreshBtn").addEventListener("click", refresh);
 
-  // 只有填了令牌才轮询：否则开着标签页过夜会每 5 秒打一条 401 把设备日志刷满。
-  if (token()) { refresh(); start(); }
+  $("clearBtn").addEventListener("click", function () {
+    try { localStorage.removeItem(KEY); } catch (e) { /* 同 */ }
+    $("token").value = "";
+    $("tokenState").textContent = "未设置";
+    $("tokenFold").open = true;
+    snapshot = null;
+    stopPolling();
+    run.failures = 0;
+    run.lost = 0;
+    run.noAuth = false;
+    run.nextDelay = BASE_MS;
+    paint(null, null, null);
+    // 清掉令牌后再探一次：也许这台设备本来就不需要令牌，不该直接判定「未填」。
+    poll(true);
+  });
+
+  $("refreshBtn").addEventListener("click", function () {
+    run.failures = 0;
+    run.nextDelay = BASE_MS;
+    if (!token()) {
+      run.noAuth = false;
+      poll(true);
+      return;
+    }
+    poll();
+  });
+
+  $("toggleBtn").addEventListener("click", function () {
+    run.paused = !run.paused;
+    $("toggleBtn").textContent = run.paused ? "继续" : "暂停";
+    if (run.paused) {
+      stopPolling();
+      $("footState").textContent = "已暂停，不再向设备发请求";
+    } else {
+      run.nextDelay = BASE_MS;
+      poll();
+    }
+  });
+
+  // 切到后台就停：手机锁屏、笔记本合盖再挂着，会白白往设备上打请求。
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) {
+      stopPolling();
+    } else if (!run.paused && (token() || run.noAuth)) {
+      run.nextDelay = BASE_MS;
+      poll();
+    }
+  });
+
+  (function init() {
+    var saved = "";
+    try { saved = localStorage.getItem(KEY) || ""; } catch (e) { saved = ""; }
+    $("host").textContent = location.host;
+    $("token").value = saved;
+    $("tokenState").textContent = saved ? "已保存" : "未设置";
+    // 诊断项数量自己数，加一行不会再骗人。
+    $("diagCount").textContent = document.querySelectorAll(".diag > div").length + " 项";
+    $("tokenFold").open = !saved;
+
+    if (saved) {
+      poll();
+    } else {
+      // 没存令牌也探一次：服务端可能压根没配 token（回环不鉴权），
+      // 那样「等你填令牌」就是一条按提示操作也走不出去的死路。只探一次，不轮询。
+      paint(null, null, null);
+      $("footState").textContent = "正在确认这台设备需不需要令牌…";
+      poll(true);
+    }
+  })();
 })();
 </script>
 </body>
