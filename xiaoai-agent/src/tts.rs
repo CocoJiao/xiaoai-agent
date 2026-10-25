@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context};
 use serde_json::json;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{OpenAiTtsConfig, TtsConfig, TtsProvider};
 use crate::device::Device;
@@ -111,6 +111,17 @@ impl PlaybackGate {
             return;
         }
         quiet.until = Some(Instant::now() + tail);
+    }
+
+    /// 这一窗还是 `generation` 开的、并且还没结束吗。
+    ///
+    /// 「播放器进程没了」有两种相反的处置，判据只能是这一个：唤醒打断走 `begin()`，
+    /// 那里已经把 generation 推进并把窗口清掉（麦克风是放开的，不能再动它）；
+    /// 而 OOM、手动 `killall`、起音乐时 `play_url_command` 的 `killall` 都不碰窗口，
+    /// 那时窗口仍是我们的，说明真的没在播了，该收到尾巴而不是静到兜底上限。
+    pub fn owns(&self, generation: u64) -> bool {
+        let quiet = self.quiet.lock().expect("playback gate mutex poisoned");
+        quiet.generation == generation && quiet.until.is_some()
     }
 
     /// 现在能不能把音频喂给 VAD。
@@ -230,25 +241,28 @@ fn quiet_plan(config: &TtsConfig, bytes: &[u8], default_player: bool) -> Option<
     Some(QuietPlan {
         window,
         tail,
-        // 先 sleep 再查：播放器刚被后台起来，立刻 pgrep 可能还看不到它。
+        // 先 sleep 再查：播放器刚被后台起来，立刻探测可能还看不到它。
         // exit 2 = 播放器已经不在（唤醒打断会 killall），不必空转到上限。
+        //
+        // 用 `pidof` 而**不是** `pgrep`：设备是 busybox，没有 pgrep
+        // （docs/flash-troubleshooting.md 第五节）。`pidof` 也不是每台固件都编了，
+        // 所以外面再套一层 `command -v` 守卫——守卫掉了就退化成「等满上限 + 一条
+        // warn」。绝不能让「探测手段不可用」等价于「播放器已经没了」：那会把每一次
+        // 正常播放都判成被打断，于是窗口不收，麦克风静到兜底上限（几十秒）。
         wait_script: Some(format!(
-            "i=0; while [ $i -lt {iterations} ]; do sleep 0.2; grep -q EndReached {PLAYER_LOG_PATH} 2>/dev/null && exit 0; pgrep miplayer >/dev/null 2>&1 || exit 2; i=$((i+1)); done; exit 1"
+            "i=0; while [ $i -lt {iterations} ]; do sleep 0.2; grep -q EndReached {PLAYER_LOG_PATH} 2>/dev/null && exit 0; if command -v pidof >/dev/null 2>&1; then pidof miplayer >/dev/null 2>&1 || exit 2; fi; i=$((i+1)); done; exit 1"
         )),
         wait_timeout: window + Duration::from_secs(5),
     })
 }
 
-/// 在设备上等播放器把这一句放完，然后让静音窗收紧到尾巴。
-///
-/// 失败（`EndReached` 没出现 / 命令跑不了）不关窗：窗口仍然按开窗时的上限自己
-/// 过期。宁可多静一会儿也不要在还在出声的时候把麦克风放回来。
 /// 等结束脚本的三种结局。
 ///
 /// 分开是因为处置不同：正常放完要收窗；**被唤醒打断**时播放器已被 `killall`，
 /// 窗口早在 `begin()` 里清掉了，这里只该打 debug——打成 warn 会让用户每喊一声
 /// 打断都在设备日志里留下一条看起来像故障的记录（真机实测就是这样，一次打断
-/// 换一条 `没等到 EndReached` 的 WARN）。
+/// 换一条 `没等到 EndReached` 的 WARN）。其余「播放器没了」的原因见
+/// `watch_playback_end` 的 `Interrupted` 分支。
 #[derive(Debug, PartialEq, Eq)]
 enum PlaybackEnd {
     /// 看到 `EndReached`：这一句放完了。
@@ -267,6 +281,10 @@ fn classify_playback_end(exit_code: i32) -> PlaybackEnd {
     }
 }
 
+/// 在设备上等播放器把这一句放完，然后让静音窗收紧到尾巴。
+///
+/// 失败（`EndReached` 没出现 / 命令跑不了）不关窗：窗口仍然按开窗时的上限自己
+/// 过期。宁可多静一会儿也不要在还在出声的时候把麦克风放回来。
 async fn watch_playback_end(
     device: Device,
     gate: Arc<PlaybackGate>,
@@ -285,16 +303,31 @@ async fn watch_playback_end(
     match classify_playback_end(exit_code) {
         PlaybackEnd::Finished => {
             gate.settle_quiet_window(generation, tail);
-            debug!(
+            // 提到 info 而不是 debug：这一行是**唯一**能证明「窗口是被 EndReached
+            // 收紧、而不是跑到兜底上限」的证据。每轮一条，成本可以忽略。
+            info!(
                 tail_ms = tail.as_millis() as u64,
-                "播放器报告 EndReached，静音窗收紧到尾巴"
+                settled_by = "EndReached",
+                "静音窗收紧到尾巴"
             );
         }
-        PlaybackEnd::Interrupted => debug!(
-            "播放器已不在（多半是唤醒打断的 killall）：静音窗已由新会话清掉，不再等 EndReached"
-        ),
+        PlaybackEnd::Interrupted => {
+            // 播放器没了**不等于**被打断：OOM、手动 killall、起音乐时
+            // `play_url_command` 里的 killall 都会走到这里，而那时窗口还在本次
+            // generation 手里。那种情况是真的没在播了，收到尾巴就好；只有唤醒
+            // 打断（`begin()` 已推进 generation 并清窗）才什么都不做。
+            let owned = gate.owns(generation);
+            if owned {
+                gate.settle_quiet_window(generation, tail);
+            }
+            debug!(
+                settled_to_tail = owned,
+                "播放器进程已不在（打断或自行退出），不再等 EndReached"
+            );
+        }
         PlaybackEnd::Unclear(code) => warn!(
             exit = code,
+            settled_by = "cap",
             "等播放器结束的脚本没等到 EndReached：静音窗按兜底上限自己过期"
         ),
     }
@@ -835,6 +868,25 @@ mod tests {
         assert!(!gate.mic_muted(), "新会话不能再静音");
     }
 
+    /// 「这一窗还是我们的吗」——`Interrupted` 分支靠它决定收不收窗。
+    ///
+    /// 唤醒打断（`begin()`）之后不该再动窗口：麦克风那时已经放开，把它收到尾巴
+    /// 反而会让用户喊完唤醒词的第一句话被吃掉。而窗口还在手上时（OOM / 手动
+    /// killall / 起音乐时的 killall）必须收，否则会静到兜底上限。
+    #[test]
+    fn owns_follows_the_generation() {
+        let gate = PlaybackGate::default();
+        let generation = gate.mute_mic_for(Duration::from_secs(30));
+        assert!(gate.owns(generation), "刚开的窗应当属于自己");
+
+        gate.begin();
+        assert!(!gate.owns(generation), "新会话之后旧 generation 不再是我们的");
+
+        let next = gate.mute_mic_for(Duration::from_secs(30));
+        assert!(gate.owns(next), "新窗属于新 generation");
+        assert!(!gate.owns(generation), "旧 generation 永远不再属于我们");
+    }
+
     /// 16k 单声道 16bit 的 canonical 头；`data_len_field` 故意可传流式哨兵值。
     fn wav_header(byte_rate: u32, data_len_field: u32) -> Vec<u8> {
         let mut out = Vec::new();
@@ -948,14 +1000,26 @@ mod tests {
 
     /// 「播放器进程没了就退出」这条必须在脚本里：只等 `EndReached` 的话，一次
     /// 唤醒打断会让这个任务空转到兜底上限，然后留下来一条 WARN。
+    ///
+    /// 用 `pidof` 不用 `pgrep`：设备上没有 `pgrep`（busybox），用了会让每一次正常
+    /// 播放都在第一轮被判成「被打断」。`command -v` 守卫则是反过来的一层：连
+    /// `pidof` 都没有的固件要退化成「等满上限」，不能被当成「播放器没了」。
     #[test]
     fn the_wait_script_gives_up_when_the_player_is_gone() {
         let mut wav = wav_header(32_000, 3_200);
         wav.extend(std::iter::repeat_n(0_u8, 3_200));
         let plan = quiet_plan(&TtsConfig::default(), &wav, true).unwrap();
         let script = plan.wait_script.expect("默认播放器");
-        assert!(script.contains("pgrep miplayer"), "{script}");
+        assert!(script.contains("pidof miplayer"), "{script}");
         assert!(script.contains("exit 2"), "{script}");
+        assert!(
+            script.contains("command -v pidof"),
+            "探测命令本身要对「设备上有没有它」设防：{script}"
+        );
+        assert!(
+            !script.contains("pgrep"),
+            "设备是 busybox，没有 pgrep：{script}"
+        );
     }
 
     /// 关掉开关时一条窗口都不开：这是「宁可自问自答也要留免唤醒插话」的出口。
