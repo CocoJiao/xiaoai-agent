@@ -39,7 +39,7 @@ use crate::device::Device;
 use crate::music::MusicService;
 use crate::shell::TIMEOUT_ERROR_PREFIX;
 use crate::speech::{SocketOwnership, SpeechHandle, SpeechService, SpeechServiceEvent, SpeechTurn};
-use crate::tts::{TtsHealth, TtsRouter};
+use crate::tts::{PlaybackGate, TtsHealth, TtsRouter};
 
 /// TTS 健康度是**进程级**的：局部变量会随每次 `run_session` 归零，
 /// 「坏了三天」就永远攒不到阈值。
@@ -94,6 +94,8 @@ async fn main() -> anyhow::Result<()> {
     let airplay = AirPlayService::start(initial.airplay.clone()).await?;
     let agent = Arc::new(AgentRuntime::new(config.clone(), device.clone(), music.clone()).await?);
     let failures = Arc::new(AtomicU32::new(0));
+    // 播放令牌：进程级。唤醒/停止都会 begin()，见 tts.rs 的 PlaybackGate 文档。
+    let playback = Arc::new(PlaybackGate::default());
     let (reload_tx, mut reload_rx) = mpsc::channel::<()>(1);
     spawn_sighup_listener(reload_tx);
     // 重载去抖门：同时只跑一个，期间的请求合并成下一轮。
@@ -142,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
                             let _ = active.task.await;
                             let state = build_turn_state(
                                 &config, &initial.device, &device, &asr, &agent, &music,
-                                &airplay, &failures,
+                                &airplay, &playback, &failures,
                             );
                             // 服务已经报故障，收尾命令可能没人应答；给 2s 上限，
                             // 别让「让位」本身卡在一个等不到回复的 oneshot 上。
@@ -174,8 +176,11 @@ async fn main() -> anyhow::Result<()> {
                         );
                         let state = build_turn_state(
                             &config, &initial.device, &device, &asr, &agent, &music, &airplay,
-                            &failures,
+                            &playback, &failures,
                         );
+                        // 令牌要**最先**失效：`interrupt_turn` 里有 await，将来若它内部
+                        // 加了出声动作，放在 abort 之后会让那句落在旧令牌有效期内。
+                        state.playback.begin();
                         if let Some(active) = active_session.take() {
                             let interrupted = active.turn_id.load(Ordering::Relaxed);
                             if !active.task.is_finished() {
@@ -199,6 +204,20 @@ async fn main() -> anyhow::Result<()> {
                         let airplay_interrupted = airplay.interrupt_for_wake().await;
                         if !music_interrupted && !airplay_interrupted {
                             device.abort_current_output().await;
+                        } else {
+                            // 音乐是被 pause/duck 打断的：`killall miplayer` 会把暂停中的
+                            // 音乐进程一起清掉（音乐状态就回不来了），所以这里只掐 TTS
+                            // 自己的进程。
+                            //
+                            // 残留缺口（写在案，别当没有）：外部 TTS 走 `miplayer` 播放，
+                            // 和音乐共用进程名，这种情况下答话音频要等它自己播完。音乐
+                            // 默认关闭（music.enabled: false），真机验收里有一条专门验这个。
+                            if let Err(err) = device
+                                .run_raw("killall tts_play.sh 2>/dev/null", Duration::from_secs(5))
+                                .await
+                            {
+                                warn!(error = %err, "唤醒打断时没能掐掉 TTS 播放进程");
+                            }
                         }
                         // LED 清理留在这一层：任务已被 abort，run_turn 的尾巴跑不到。
                         cleanup_turn_leds(&device, &initial.device).await;
@@ -390,6 +409,8 @@ struct TurnState {
     airplay: AirPlayService,
     /// 连续失败轮数。到阈值就说明「能唤醒但答不上」已经持续了整段会话，
     /// 与其继续硬撑，不如把麦克风还给原厂小爱。
+    /// 播放令牌：唤醒 / `/stop` / 新一轮都会 `begin()`，让还在飞的合成与播放失效。
+    playback: Arc<PlaybackGate>,
     failures: Arc<AtomicU32>,
 }
 
@@ -405,6 +426,7 @@ fn build_turn_state(
     agent: &Arc<AgentRuntime>,
     music: &Arc<MusicService>,
     airplay: &AirPlayService,
+    playback: &Arc<PlaybackGate>,
     failures: &Arc<AtomicU32>,
 ) -> TurnState {
     TurnState {
@@ -415,6 +437,7 @@ fn build_turn_state(
         agent: agent.clone(),
         music: music.clone(),
         airplay: airplay.clone(),
+        playback: playback.clone(),
         failures: failures.clone(),
     }
 }
@@ -1074,7 +1097,7 @@ async fn run_session(
             // 已经答出来。而且配置了 fallback_to_native: false 的人预期是「宁可
             // 不说话」，若因此让位，音箱会整体下线等人工 start-agent.sh start，
             // 落差太大。所以这里只 warn + 继续这一轮剩下的流程。
-            match TtsRouter::new(state.device.clone())
+            match TtsRouter::new(state.device.clone(), state.playback.clone())
                 .speak(&config.tts, &reply.text)
                 .await
             {
@@ -1222,6 +1245,7 @@ mod tests {
             agent,
             music,
             airplay,
+            playback: Arc::new(PlaybackGate::default()),
             failures: Arc::new(AtomicU32::new(0)),
         }
     }
