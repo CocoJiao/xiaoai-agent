@@ -71,104 +71,80 @@ pub async fn spawn(
 }
 
 fn build_router(state: Arc<ControlState>) -> Router {
-    Router::new()
-        .route("/", get(panel))
+    // 鉴权写成 layer，而不是让每个 handler 自己记得调 authorize：
+    // #9 下一步就是 /stop、/play/*，新增端点的人只要漏抄那几行就是一个
+    // **无鉴权的控制端点**，而路由结构不会提醒他。现在默认受保护，
+    // 要公开必须显式挂到下面这条 Router 上。
+    let api = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_token,
+        ));
+
+    Router::new()
+        .route("/", get(panel))
+        .merge(api)
         .with_state(state)
+}
+
+/// 统一的 Bearer 校验。**所有非公开路由都过这里**。
+///
+/// 这套设计成立的前提只有一条：跨站请求带不上自定义头。所以任何会改变状态的
+/// 端点都必须要求 `Authorization`，且不该用 GET（`<img>`/`<a>`/`<form>` 都能触发
+/// GET，但都带不上 Bearer——GET + 不鉴权 = CSRF 跳板）。
+async fn require_token(
+    State(state): State<Arc<ControlState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match authorize(&state.token, request.headers()) {
+        Ok(()) => next.run(request).await,
+        Err(status) => (status, Json(json!({ "error": "unauthorized" }))).into_response(),
+    }
 }
 
 /// 控制台页面。**故意不鉴权**：它只是一张静态 HTML，本身不含任何设备信息，
 /// token 由页面里输入一次、存 localStorage，之后的请求才带 Authorization。
 /// 这样运维不用记 curl；同时也不会把 token 写进 URL（历史、日志都会留痕）。
-async fn panel() -> Html<&'static str> {
-    Html(PANEL_HTML)
+async fn panel() -> Response {
+    // 面板只有内联样式与脚本：
+    // - `default-src 'none'` + `connect-src 'self'`：页面永远不加载外部资源（和
+    //   「无 CDN」的目标一致），请求只能打到本机；
+    // - `frame-ancestors 'none'`：不能被嵌进 iframe —— 第二步加了「停止播放」
+    //   这类按钮后，点击劫持就成立了。
+    let csp = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';                connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+    (
+        [
+            (axum::http::header::CONTENT_SECURITY_POLICY, csp),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        Html(PANEL_HTML),
+    )
+        .into_response()
 }
 
 /// 单文件控制台：无外部依赖（设备上没有 CDN 也要能开）。
-const PANEL_HTML: &str = r#"<!doctype html>
-<html lang="zh-CN"><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>XiaoAI 控制台</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; padding: 24px; max-width: 760px; }
-  h1 { font-size: 18px; margin: 0 0 16px; }
-  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
-  input[type=password] { flex: 1 1 260px; padding: 8px 10px; border: 1px solid #8884; border-radius: 8px; background: transparent; color: inherit; font: inherit; }
-  button { padding: 8px 14px; border: 1px solid #8884; border-radius: 8px; background: #8881; color: inherit; font: inherit; cursor: pointer; }
-  button:hover { background: #8882; }
-  .card { border: 1px solid #8884; border-radius: 12px; padding: 14px 16px; margin-bottom: 12px; }
-  .k { color: #8889; font-size: 13px; }
-  .v { font-variant-numeric: tabular-nums; font-weight: 600; }
-  .ok { color: #17864a; } .bad { color: #c22a2a; }
-  pre { background: #8881; padding: 12px; border-radius: 8px; overflow: auto; font-size: 12px; margin: 0; }
-  .hint { color: #8889; font-size: 13px; }
-</style>
-<h1>XiaoAI 控制台 <span class="hint" id="who"></span></h1>
-<div class="row">
-  <input id="token" type="password" placeholder="server.token（只存在本机浏览器）">
-  <button onclick="save()">保存令牌</button>
-  <button onclick="refresh()">刷新状态</button>
-</div>
-<div class="card">
-  <div class="k">探活</div>
-  <div class="v" id="health">—</div>
-  <div class="k" id="healthWhy"></div>
-</div>
-<div class="card">
-  <div class="k">原始响应</div>
-  <pre id="raw">点「刷新状态」</pre>
-</div>
-<p class="hint">地址栏打开本页不需要令牌；令牌只用于页面发出的 /health、/status 请求。</p>
-<script>
-const $ = (id) => document.getElementById(id);
-$("token").value = localStorage.getItem("xiaoai_token") || "";
-$("who").textContent = location.host;
-function save() { localStorage.setItem("xiaoai_token", $("token").value.trim()); refresh(); }
-async function get(path) {
-  const r = await fetch(path, { headers: { Authorization: "Bearer " + ($("token").value.trim() || "") } });
-  const text = await r.text();
-  let body = null; try { body = JSON.parse(text); } catch (e) {}
-  return { status: r.status, body, text };
-}
-async function refresh() {
-  try {
-    const h = await get("/health");
-    const ok = h.status === 200;
-    $("health").textContent = h.status + " " + ((h.body && h.body.status) || "");
-    $("health").className = "v " + (ok ? "ok" : "bad");
-    if (h.body) {
-      const s = h.body.speech || {}, so = h.body.socket || {};
-      $("healthWhy").textContent =
-        "socket " + (so.owned ? "归本进程" : "不在本进程手里") +
-        " · 上次收包 " + (s.last_packet_age_s == null ? "从未" : s.last_packet_age_s + "s 前") +
-        " · 重启 " + (s.service_restarts ?? 0) + " 次 · 运行 " + (h.body.uptime_s ?? 0) + "s";
-    }
-    const st = await get("/status");
-    $("raw").textContent = JSON.stringify({ health: h.body, status: st.body }, null, 2);
-  } catch (e) {
-    $("health").textContent = "请求失败";
-    $("health").className = "v bad";
-    $("healthWhy").textContent = String(e);
-  }
-}
-refresh(); setInterval(refresh, 5000);
-</script></html>"#;
+/// 放在独立的 `.html` 里而不是 raw string：编辑器有高亮、diff 只显示 HTML、
+/// 也不会因为 JS 里出现 `"#` 而静默截断。
+const PANEL_HTML: &str = include_str!("panel.html");
 
-async fn health(State(state): State<Arc<ControlState>>, headers: HeaderMap) -> Response {
+async fn health(State(state): State<Arc<ControlState>>) -> Response {
     let (status, body) = health_response(&state);
-    match authorize(&state.token, &headers) {
-        Ok(()) => (status, Json(body)).into_response(),
-        Err(status) => (status, Json(json!({ "error": "unauthorized" }))).into_response(),
-    }
+    (status, no_store(), Json(body)).into_response()
 }
 
-async fn status(State(state): State<Arc<ControlState>>, headers: HeaderMap) -> Response {
-    match authorize(&state.token, &headers) {
-        Ok(()) => Json(status_body(&state)).into_response(),
-        Err(status) => (status, Json(json!({ "error": "unauthorized" }))).into_response(),
-    }
+async fn status(State(state): State<Arc<ControlState>>) -> Response {
+    (StatusCode::OK, no_store(), Json(status_body(&state))).into_response()
+}
+
+/// 监控端点被缓存没有任何好处（`fetch` 默认会走 HTTP 缓存），显式禁掉。
+fn no_store() -> [(axum::http::header::HeaderName, &'static str); 2] {
+    [
+        (axum::http::header::CACHE_CONTROL, "no-store"),
+        (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+    ]
 }
 
 /// 探活判据：**只看一件不会撒谎的事实——speech socket 还是不是我们的**。
@@ -391,10 +367,14 @@ mod tests {
             "页面要真的去调 API，并且用 Bearer"
         );
 
-        let unauth = reqwest::get(format!("http://127.0.0.1:{port}/health"))
-            .await
-            .unwrap();
-        assert_eq!(unauth.status(), 401, "页面不鉴权，但 API 必须鉴权");
+        // 除了面板，**每一条**路由都必须要求鉴权。这是路由级断言：
+        // 新增端点忘了挂 layer 会直接红。
+        for path in ["/health", "/status"] {
+            let unauth = reqwest::get(format!("http://127.0.0.1:{port}{path}"))
+                .await
+                .unwrap();
+            assert_eq!(unauth.status(), 401, "{path} 无令牌必须 401");
+        }
 
         let authed = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{port}/health"))
@@ -407,10 +387,40 @@ mod tests {
             200,
             "带对令牌要拿到 200（socket 仍归本进程）"
         );
+        assert_eq!(
+            authed
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "监控端点不能被缓存"
+        );
+
+        // 面板与 API 的字段契约：改名必须两边一起改，否则页面静默显示 0。
+        let body: Value = authed.json().await.unwrap();
+        assert!(body["uptime_s"].is_u64(), "uptime_s 必须是数字");
+        assert!(
+            body["socket"]["owned"].is_boolean(),
+            "socket.owned 必须是布尔"
+        );
+        assert!(
+            body["speech"]["service_restarts"].is_u64(),
+            "speech.service_restarts 必须是数字"
+        );
+        assert!(
+            body["speech"].get("last_packet_age_s").is_some(),
+            "last_packet_age_s 允许是 null，但键必须在"
+        );
+        for field in ["uptime_s", "service_restarts", "last_packet_age_s", "owned"] {
+            assert!(
+                PANEL_HTML.contains(field),
+                "页面读取的字段 `{field}` 在 panel.html 里找不到"
+            );
+        }
         cleanup(&state);
     }
 
-    /// 判据一：路径还是我们绑的那个 inode → 200 / owned: true。    /// 判据一：路径还是我们绑的那个 inode → 200 / owned: true。
+    /// 判据一：路径还是我们绑的那个 inode → 200 / owned: true。
     #[test]
     fn health_is_ok_only_while_the_socket_is_still_ours() {
         let socket = still_owned_socket("healthy");
