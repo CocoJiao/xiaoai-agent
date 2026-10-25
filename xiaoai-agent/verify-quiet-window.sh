@@ -33,15 +33,45 @@ note() { printf '      %s\n' "$*"; }
 # grep -c 在 0 命中时退出码是 1，`|| true` 是为了不把 0 变成空串。
 count() { grep -c "$1" "$SLICE" 2>/dev/null || true; }
 
+# 打失败现场：匹配行前后各几行，最多 max 行。只打不判。
+# 不用 grep -A/-B：上下文选项要 busybox 编译时开，设备上不一定有；
+# awk 读两遍同一份片段就够了（FNR == NR 是第一遍，只记行号）。
+ctx() { # $1=模式 $2=前 $3=后 $4=最多几行
+	awk -v pat="$1" -v b="$2" -v a="$3" -v max="$4" '
+		FNR == NR {
+			if ($0 ~ pat) { lo[++k] = FNR - b; hi[k] = FNR + a }
+			next
+		}
+		{
+			for (i = 1; i <= k; i++) {
+				if (FNR >= lo[i] && FNR <= hi[i]) {
+					if (++shown > max) exit
+					print "      | " $0
+					next
+				}
+			}
+		}
+	' "$SLICE" "$SLICE" 2>/dev/null
+}
+
 # 读 tts 段下的一个键（只看顶层缩进，避免把 asr.provider / llm.provider 混进来）。
+#
+# 必须裁掉行内注释和引号：`provider: native  # 临时换回验 AEC` 和
+# `provider: "native"` 是现场最常见的两种写法，而前提体检的全部价值就在那
+# 一刻——值里带着注释尾巴，判断就静默失效了。顺序不能反：先裁注释再删 key
+# 再去引号，否则 `provider: openai  # "x"` 的尾巴会把引号处理削坏。
 cfg() {
 	[ -r "$AGENT_CONFIG" ] || return 0
 	awk -v key="$1" '
 		/^tts:/ { t = 1; next }
 		/^[^[:space:]#]/ { t = 0 }
 		t && $0 ~ "^[[:space:]]+" key ":" {
-			sub("^[[:space:]]+" key ":[[:space:]]*", "")
-			print
+			v = $0
+			sub(/[[:space:]]+#.*$/, "", v)
+			sub("^[[:space:]]+" key ":[[:space:]]*", "", v)
+			sub(/^["\047]/, "", v)
+			sub(/["\047]$/, "", v)
+			print v
 			exit
 		}
 	' "$AGENT_CONFIG" 2>/dev/null
@@ -99,6 +129,11 @@ check)
 	offset=$(cat "$STATE")
 
 	# 位移失效检查：日志被重置 / 换了文件时，负向断言会在空片段上全 PASS。
+	# 顺序必须是「先核大小、再切片段、再核行数、最后才跑断言」：反了就会先在
+	# 空片段上攒出几条 PASS 再退出，那是比报错更坏的一种。
+	# 注意位移是绝对字节数：只适用于「只追加」的日志。设备上的 agent.log 目前
+	# 就是只追加；若是「复制+截断」式轮转，新文件会很快重新超过 offset，这道
+	# 门槛挡不住。
 	size=$(wc -c < "$AGENT_LOG" | tr -d ' ')
 	if [ "$size" -lt "$offset" ]; then
 		echo "日志被重置过或换了文件（当前 $size 字节 < 记录的位移 $offset）——" >&2
@@ -110,7 +145,7 @@ check)
 	lines=$(wc -l < "$SLICE" | tr -d ' ')
 	if [ "$lines" -lt "$MIN_LINES" ]; then
 		echo "片段只有 $lines 行（少于 $MIN_LINES）：三次交互不可能这么少。" >&2
-		echo "确认三件事都做了（或 set XIAOAI_VERIFY_MIN_LINES 调门槛）再 check。" >&2
+		echo "确认三件事都做了（或 XIAOAI_VERIFY_MIN_LINES=10 $0 check 调门槛）再 check。" >&2
 		exit 2
 	fi
 
@@ -157,16 +192,26 @@ check)
 		pass "没有录音跑到 end=max_duration（回声没进 VAD）"
 	else
 		bad "有 $echo_utt 段录音跑到 end=max_duration（录到上限才停）：可能是回声，也可能是房间里别的声源——对照紧随其后的 USER_ASR 原文和 peak 判断，别直接去调采集阈值"
+		note "现场（匹配行 + 其后 6 行）："
+		ctx 'end=max_duration' 0 6 12
 	fi
 
 	# 5) 整轮答案没作废。原来查的 `timed out waiting for user speech` 在今天的代码里
 	#    恒不出现（is_capture_timeout 把它改写成 info "session idle timeout"，
 	#    原文只可能经由 error "turn failed: {err:?}" 出去，而空闲超时那条到不了那里），
 	#    所以改成查回声三连的最后一环：答案被当成提问 → 整轮失败。
+	#
+	#    **末尾那个冒号是载荷，不是排版**：唤醒打断的收尾也打 "turn failed"
+	#    （main.rs 的 InterruptCause::Failure("turn failed")），但它渲染成
+	#    `cause="turn failed"`，不带冒号；只有 error!("turn failed: {err:?}")
+	#    带冒号。谁把日志改成 `turn failed - ...`，这条断言就会静默恒真——
+	#    正是上一轮那条断言翻的车，别再翻一次。
 	if [ "$failed" -eq 0 ]; then
 		pass "没有整轮失败（turn failed）：回声没演变成「答案被当成提问」"
 	else
 		bad "出现 $failed 次 turn failed：整轮答案作废了——可能是回声被当成提问后 LLM 失败，也可能是网络/ASR 服务故障，对照紧随其后的 USER_ASR 原文判断"
+		note "现场（匹配行前后各 3 行）："
+		ctx 'turn failed:' 3 3 14
 	fi
 
 	# 只报数不判定：三步之间停顿超过 session_idle_timeout_s 也会出现，属正常。
