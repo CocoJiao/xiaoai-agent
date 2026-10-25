@@ -148,6 +148,18 @@ tts:
     timeout_s: 30
     # output_dir: /tmp
 
+# 本地控制面（issue #9）。默认关闭：关闭时连端口都不 bind。
+# 安全边界：这是新增的网络暴露面。给 Home Assistant 用时才打开，并且：
+#   - 只绑内网地址（不要 0.0.0.0）
+#   - 一定设 token（空 token = 不鉴权，内网任何主机都能让它说话）
+server:
+  enabled: false
+  host: 127.0.0.1
+  port: 8765
+  token: ""
+  # 端点（当前）：GET /health（socket 归属 + 收包年龄）、GET /status（同上 + pid/配置路径）
+  # 鉴权：Authorization: Bearer <token>
+
 music:
   enabled: false
   provider: navidrome

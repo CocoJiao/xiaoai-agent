@@ -22,6 +22,7 @@ pub struct AppConfig {
     pub music: MusicConfig,
     pub airplay: AirPlayConfig,
     pub tts: TtsConfig,
+    pub server: ServerConfig,
 }
 
 impl AppConfig {
@@ -689,6 +690,32 @@ fn section_changed<T: std::fmt::Debug>(old: &T, new: &T) -> bool {
     format!("{old:?}") != format!("{new:?}")
 }
 
+/// 本地控制面（issue #9）。**默认关闭**：关闭时连 socket 都不 bind。
+///
+/// 安全边界：这是新增的网络暴露面，所以默认 `enabled: false`，默认只绑
+/// `127.0.0.1`。想给 Home Assistant 用就绑内网地址，并且**设 token**；
+/// 空 token = 不鉴权，只在该端口确实不可从外网到达时才可接受。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    /// `Authorization: Bearer <token>`。空字符串 = 不鉴权。
+    pub token: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "127.0.0.1".to_string(),
+            port: 8765,
+            token: String::new(),
+        }
+    }
+}
+
 /// 回答的音频出口。第一步只定义「谁来念」与「失败怎么办」，
 /// 具体 provider 的参数（音色、密钥、端点）等接入时再加，避免先把配置面铺开。
 #[derive(Debug, Clone, Deserialize)]
@@ -808,6 +835,10 @@ pub fn classify_config_change(old: &AppConfig, new: &AppConfig) -> ConfigChanges
     }
     if section_changed(&old.music, &new.music) {
         changes.applied.push("music");
+    }
+    // server: 监听器在启动时 bind（关闭时压根不 bind），换 host/port 必须重启。
+    if section_changed(&old.server, &new.server) {
+        changes.needs_restart.push("server");
     }
     // tts: 每轮现读字段（provider 决定这次回答走哪条路），换句柄即生效。
     if section_changed(&old.tts, &new.tts) {
