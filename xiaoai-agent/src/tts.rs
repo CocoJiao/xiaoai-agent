@@ -230,8 +230,10 @@ fn quiet_plan(config: &TtsConfig, bytes: &[u8], default_player: bool) -> Option<
     Some(QuietPlan {
         window,
         tail,
+        // 先 sleep 再查：播放器刚被后台起来，立刻 pgrep 可能还看不到它。
+        // exit 2 = 播放器已经不在（唤醒打断会 killall），不必空转到上限。
         wait_script: Some(format!(
-            "i=0; while [ $i -lt {iterations} ]; do grep -q EndReached {PLAYER_LOG_PATH} 2>/dev/null && exit 0; sleep 0.2; i=$((i+1)); done; exit 1"
+            "i=0; while [ $i -lt {iterations} ]; do sleep 0.2; grep -q EndReached {PLAYER_LOG_PATH} 2>/dev/null && exit 0; pgrep miplayer >/dev/null 2>&1 || exit 2; i=$((i+1)); done; exit 1"
         )),
         wait_timeout: window + Duration::from_secs(5),
     })
@@ -241,6 +243,30 @@ fn quiet_plan(config: &TtsConfig, bytes: &[u8], default_player: bool) -> Option<
 ///
 /// 失败（`EndReached` 没出现 / 命令跑不了）不关窗：窗口仍然按开窗时的上限自己
 /// 过期。宁可多静一会儿也不要在还在出声的时候把麦克风放回来。
+/// 等结束脚本的三种结局。
+///
+/// 分开是因为处置不同：正常放完要收窗；**被唤醒打断**时播放器已被 `killall`，
+/// 窗口早在 `begin()` 里清掉了，这里只该打 debug——打成 warn 会让用户每喊一声
+/// 打断都在设备日志里留下一条看起来像故障的记录（真机实测就是这样，一次打断
+/// 换一条 `没等到 EndReached` 的 WARN）。
+#[derive(Debug, PartialEq, Eq)]
+enum PlaybackEnd {
+    /// 看到 `EndReached`：这一句放完了。
+    Finished,
+    /// 播放器进程已经不在了：被打断（或自己退了）。
+    Interrupted,
+    /// 空转到上限仍没结果。
+    Unclear(i32),
+}
+
+fn classify_playback_end(exit_code: i32) -> PlaybackEnd {
+    match exit_code {
+        0 => PlaybackEnd::Finished,
+        2 => PlaybackEnd::Interrupted,
+        other => PlaybackEnd::Unclear(other),
+    }
+}
+
 async fn watch_playback_end(
     device: Device,
     gate: Arc<PlaybackGate>,
@@ -249,19 +275,28 @@ async fn watch_playback_end(
     wait_timeout: Duration,
     tail: Duration,
 ) {
-    match device.run_raw(&wait_script, wait_timeout).await {
-        Ok(result) if result.exit_code == 0 => {
+    let exit_code = match device.run_raw(&wait_script, wait_timeout).await {
+        Ok(result) => result.exit_code,
+        Err(err) => {
+            warn!(error = %err, "等播放器结束的命令失败：静音窗按兜底上限自己过期");
+            return;
+        }
+    };
+    match classify_playback_end(exit_code) {
+        PlaybackEnd::Finished => {
             gate.settle_quiet_window(generation, tail);
             debug!(
                 tail_ms = tail.as_millis() as u64,
                 "播放器报告 EndReached，静音窗收紧到尾巴"
             );
         }
-        Ok(result) => warn!(
-            exit = result.exit_code,
+        PlaybackEnd::Interrupted => debug!(
+            "播放器已不在（多半是唤醒打断的 killall）：静音窗已由新会话清掉，不再等 EndReached"
+        ),
+        PlaybackEnd::Unclear(code) => warn!(
+            exit = code,
             "等播放器结束的脚本没等到 EndReached：静音窗按兜底上限自己过期"
         ),
-        Err(err) => warn!(error = %err, "等播放器结束的命令失败：静音窗按兜底上限自己过期"),
     }
 }
 
@@ -900,6 +935,27 @@ mod tests {
             "应为 3.6s，实际 {:?}",
             plan.window
         );
+    }
+
+    /// 播放器被打断（唤醒会 `killall miplayer`）时日志里不该出现「没等到 EndReached」
+    /// 这种像故障的 WARN：真机实测一次打断换一条，排查时全是噪音。
+    #[test]
+    fn an_interrupted_playback_is_not_reported_as_a_failure() {
+        assert_eq!(classify_playback_end(0), PlaybackEnd::Finished);
+        assert_eq!(classify_playback_end(2), PlaybackEnd::Interrupted);
+        assert_eq!(classify_playback_end(1), PlaybackEnd::Unclear(1));
+    }
+
+    /// 「播放器进程没了就退出」这条必须在脚本里：只等 `EndReached` 的话，一次
+    /// 唤醒打断会让这个任务空转到兜底上限，然后留下来一条 WARN。
+    #[test]
+    fn the_wait_script_gives_up_when_the_player_is_gone() {
+        let mut wav = wav_header(32_000, 3_200);
+        wav.extend(std::iter::repeat_n(0_u8, 3_200));
+        let plan = quiet_plan(&TtsConfig::default(), &wav, true).unwrap();
+        let script = plan.wait_script.expect("默认播放器");
+        assert!(script.contains("pgrep miplayer"), "{script}");
+        assert!(script.contains("exit 2"), "{script}");
     }
 
     /// 关掉开关时一条窗口都不开：这是「宁可自问自答也要留免唤醒插话」的出口。
