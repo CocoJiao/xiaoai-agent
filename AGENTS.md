@@ -217,22 +217,41 @@ fields into `device` or `capture` would make them restart-only.
 
 ### Verifying it on the device
 
-`verify-quiet-window.sh start` records the current log offset and prints the
-three interactions to perform; `verify-quiet-window.sh check` then asserts
-against **only** the bytes appended since that offset. That indirection is the
-point: `agent.log` is append-only across days, so a plain `grep` would count
-last week's `end=max_duration` and turn "verified" into an illusion.
+`verify-quiet-window.sh start` records the current log offset (and prints a
+config precheck) plus the three interactions to perform;
+`verify-quiet-window.sh check` then asserts against **only** the bytes appended
+since that offset. That indirection is the point: `agent.log` is append-only
+across days, so a plain `grep` would count last week's `end=max_duration` and
+turn "verified" into an illusion. `scp` does not preserve the exec bit (see
+`docs/flash-troubleshooting.md`, section 5), so `chmod +x` after copying.
 
 `check` exits 0 only when all five assertions pass — the window actually opened
 (`CAPTURE_MUTED`), it was shrunk by `EndReached` rather than the cap, no
 "no EndReached" warning leaked out of an interruption, no utterance reached
-`end=max_duration`, and no `timed out waiting for user speech` (the last one
-also watches whether `mipns` closes the stream on its own). It additionally
-prints each mute→unmute interval, which is read against the reply's length:
-≈ audio duration + 3 s means the window followed playback, close to
-`grace + 2 × duration + 10 s` means it ate the cap — the one thing a green run
-must not hide. It needs `tts.provider` to be an external player (`native` never
-mutes, so there is nothing to measure) and `RUST_LOG` at `info`.
+`end=max_duration`, and no `turn failed:` line. The last one used to be
+`timed out waiting for user speech`, which **cannot** appear: `is_capture_timeout`
+rewrites that error into `info!("session idle timeout")` at all three capture
+call sites, so it only reaches the log via `error!("turn failed: {err:?}")` when
+the turn genuinely fails. `turn failed:` is therefore the observable end of the
+echo chain (answer transcribed as a question → LLM failure).
+
+Both `end=max_duration` and `turn failed:` can also come from something other
+than echo — another sound source in the room, a network or backend outage — so
+the scripts point at the following `USER_ASR` line instead of asserting a cause.
+`check` bails with exit 2 (no verdict, not a pass) when the log is smaller than
+the recorded offset or the slice has fewer than 20 lines: negative assertions
+over an empty slice are all vacuously true, and "all PASS" must never mean "we
+looked at nothing". It additionally prints each mute→unmute interval, which is
+read against the reply's length: ≈ audio duration + 3 s means the window
+followed playback, close to `grace + 2 × duration + 10 s` means it ate the cap
+— the one thing a green run must not hide.
+
+Two preconditions, both checked by `start`: `tts.provider` must be an external
+player (`native` goes through pns, never mutes, so there is nothing to measure),
+and `tts.playback_command` must be left at the default. A custom command has
+`wait_script: None`, so no watcher is spawned at all — assertion 2 fails by
+design and assertion 3 is vacuous, and the script says so rather than blaming
+the window. `RUST_LOG` at `info` is enough.
 
 ## Control Plane Auth
 

@@ -1,22 +1,29 @@
 #!/bin/sh
 #
-# 静音窗真机验收（issue #6 第一步·外部播放期间抑制采集）：把「四条证据」变成退出码。
+# 静音窗真机验收（issue #6 第一步·外部播放期间抑制采集）：把证据变成退出码。
 #
-# 用法（在设备上跑）：
-#   ./verify-quiet-window.sh start   # 记下日志当前位移，打印要做的三件事
+# 用法（在设备上跑；scp 过去记得先 chmod +x，scp 不保留执行位）：
+#   ./verify-quiet-window.sh start   # 记下日志当前位移，打印前提体检和要做的三件事
 #   （按提示和音箱交互）
 #   ./verify-quiet-window.sh check   # 只检查 start 之后新增的那段日志
 #
 # 为什么按位移而不是整份日志：agent.log 是长期追加的，整份 grep 会把上周那条
 # `end=max_duration` 也算进来，「验过了」就成了假象。
 #
+# 为什么 check 还要先核位移有没有失效：日志被重置/被 `>` 重写过之后片段是空的，
+# 而「没有 X」这种负向断言在空片段上恒真——最坏的情况是人看到几条 PASS，
+# 就当成「回声没进来」。
+#
 # 只用 busybox 里有的东西（awk / grep / tail / wc / sort）。设备上没有 pgrep、
 # 没有 bash 数组，所以这里也不用（见 docs/flash-troubleshooting.md 第五节）。
 set -u
 
 AGENT_LOG=${XIAOAI_AGENT_LOG:-/data/open-xiaoai/xiaoai-agent.log}
+AGENT_CONFIG=${XIAOAI_AGENT_CONFIG:-/data/open-xiaoai/agent.yaml}
 STATE=${XIAOAI_VERIFY_STATE:-/tmp/xiaoai-verify-quiet.offset}
 SLICE=${XIAOAI_VERIFY_SLICE:-/tmp/xiaoai-verify-quiet.slice}
+# 三次交互怎么也有几十行；少于这个数说明交互没做完，结论不可信。
+MIN_LINES=${XIAOAI_VERIFY_MIN_LINES:-20}
 
 fails=0
 pass() { printf 'PASS  %s\n' "$*"; }
@@ -26,12 +33,51 @@ note() { printf '      %s\n' "$*"; }
 # grep -c 在 0 命中时退出码是 1，`|| true` 是为了不把 0 变成空串。
 count() { grep -c "$1" "$SLICE" 2>/dev/null || true; }
 
+# 读 tts 段下的一个键（只看顶层缩进，避免把 asr.provider / llm.provider 混进来）。
+cfg() {
+	[ -r "$AGENT_CONFIG" ] || return 0
+	awk -v key="$1" '
+		/^tts:/ { t = 1; next }
+		/^[^[:space:]#]/ { t = 0 }
+		t && $0 ~ "^[[:space:]]+" key ":" {
+			sub("^[[:space:]]+" key ":[[:space:]]*", "")
+			print
+			exit
+		}
+	' "$AGENT_CONFIG" 2>/dev/null
+}
+
+# 前提体检：验完才发现 provider 是 native 是最冤的返工。
+precheck() {
+	printf '前提体检（%s）：\n' "$AGENT_CONFIG"
+	if [ ! -r "$AGENT_CONFIG" ]; then
+		note "读不到配置文件，下面按「用默认值」假设——自己核一遍 tts 段"
+		return 0
+	fi
+	provider=$(cfg provider)
+	playback=$(cfg playback_command)
+	suppress=$(cfg suppress_capture_while_playing)
+	printf '  provider = %s\n' "${provider:-（没写，默认 native）}"
+	printf '  playback_command = %s\n' "${playback:-（没写 = 默认播放器，这是验收要求的配置）}"
+	printf '  suppress_capture_while_playing = %s\n' "${suppress:-（没写，默认 true）}"
+
+	[ -n "$provider" ] && [ "$provider" != "native" ] \
+		|| note "!! provider 是 native 或没写：native 走 pns 有 AEC，根本不开静音窗，这里验不出任何东西"
+	[ -z "$playback" ] \
+		|| note "!! playback_command 是自定义的：看不到播放器日志，窗口只能按时长估，断言 2 必然 FAIL、断言 3 恒 PASS。验收请先注释掉它用默认播放器"
+	[ "$suppress" != "false" ] \
+		|| note "!! suppress_capture_while_playing=false：静音窗被关掉了，断言 1 必然 FAIL"
+}
+
 case "${1:-check}" in
 start)
 	[ -r "$AGENT_LOG" ] || { echo "读不到日志：$AGENT_LOG" >&2; exit 2; }
 	offset=$(wc -c < "$AGENT_LOG" | tr -d ' ')
 	printf '%s\n' "$offset" > "$STATE"
 	printf '已记录日志位移：%s 字节（%s）\n\n' "$offset" "$AGENT_LOG"
+
+	precheck
+	echo
 	cat <<'TXT'
 接下来按顺序做三件事，全部做完再跑 ./verify-quiet-window.sh check
 
@@ -40,23 +86,45 @@ start)
   3) 长回答：问一句答案超过 25 秒的，播完看它能不能接下一句。
 
 前提：tts.provider 是外部 TTS（native 不开静音窗，验不出东西）；
+      tts.playback_command 保持默认（自定义命令必 FAIL 断言 2）；
       RUST_LOG 至少 info（默认就是）；prompt 里别让它答得太短。
+
+check 通过 ≠ 三件事都验过了：只做第 1 件也能全 PASS。所以通过后请把
+USER_ASR 的原文和这段输出一起贴出来——「1 秒内停住」只有人能验。
 TXT
 	;;
 check)
 	[ -r "$AGENT_LOG" ] || { echo "读不到日志：$AGENT_LOG" >&2; exit 2; }
 	[ -f "$STATE" ] || { echo "先跑一次：$0 start" >&2; exit 2; }
 	offset=$(cat "$STATE")
+
+	# 位移失效检查：日志被重置 / 换了文件时，负向断言会在空片段上全 PASS。
+	size=$(wc -c < "$AGENT_LOG" | tr -d ' ')
+	if [ "$size" -lt "$offset" ]; then
+		echo "日志被重置过或换了文件（当前 $size 字节 < 记录的位移 $offset）——" >&2
+		echo "片段是空的，「没有 X」会全部假 PASS。请重新 start 再验一次。" >&2
+		exit 2
+	fi
 	tail -c "+$((offset + 1))" "$AGENT_LOG" > "$SLICE" 2>/dev/null || : > "$SLICE"
+
+	lines=$(wc -l < "$SLICE" | tr -d ' ')
+	if [ "$lines" -lt "$MIN_LINES" ]; then
+		echo "片段只有 $lines 行（少于 $MIN_LINES）：三次交互不可能这么少。" >&2
+		echo "确认三件事都做了（或 set XIAOAI_VERIFY_MIN_LINES 调门槛）再 check。" >&2
+		exit 2
+	fi
 
 	muted=$(count 'CAPTURE_MUTED')
 	unmuted=$(count 'CAPTURE_UNMUTED')
 	settled=$(count '静音窗收紧到尾巴')
 	capped=$(count '没等到 EndReached')
-	cut=$(count 'timed out waiting for user speech')
+	failed=$(count 'turn failed:')
+	idle=$(count 'session idle timeout')
 	echo_utt=$(grep 'CAPTURE_UTTERANCE' "$SLICE" 2>/dev/null | grep -c 'end=max_duration' || true)
 
-	printf '本轮新增日志 %s 行（从位移 %s 起）\n\n' "$(wc -l < "$SLICE" | tr -d ' ')" "$offset"
+	printf '本轮新增日志 %s 行（从位移 %s 起）\n\n' "$lines" "$offset"
+
+	playback=$(cfg playback_command)
 
 	# 1) 静音窗真的开过：provider / 开关 / 播放命令是不是外部那条路。
 	if [ "$muted" -ge 1 ]; then
@@ -70,28 +138,39 @@ check)
 		pass "按 EndReached 收窗 $settled 次（走的是事实，不是兜底上限）"
 	else
 		bad "没有一次按 EndReached 收窗：窗口全靠兜底上限，等于每次回答后静到上限（几十秒）"
+		[ -z "$playback" ] && note "（playback_command 是默认的，所以这条 FAIL 是真问题）" \
+			|| note "（playback_command 是自定义的：这条路径设计上就看不到播放器日志，必然 FAIL，不是回声漏了）"
 	fi
 
-	# 3) 打断不该留下「没等到 EndReached」的告警。
+	# 3) 打断不该留下「没等到 EndReached」的告警。前提是默认播放器——自定义命令
+	#    根本不 spawn 等待任务，这条恒 PASS，所以下面单独提示。
 	if [ "$capped" -eq 0 ]; then
 		pass "没有「没等到 EndReached」告警（打断被正确识别，没有空转到上限）"
 	else
 		bad "出现 $capped 次「没等到 EndReached」：打断没被识别，先确认设备上 pidof 可用"
 	fi
+	[ -z "$playback" ] || note "!! playback_command 是自定义的：没有等待任务，这条 PASS 不构成证据"
 
-	# 4) 回声没有进 VAD：否则录音会一路到 max_utterance。
+	# 4) 回声没有进 VAD：否则录音会一路到 max_utterance。但上限也可能是别的声源，
+	#    别把归因写死——AGENTS.md 记着 provider: native 也出过 end=max_duration。
 	if [ "$echo_utt" -eq 0 ]; then
 		pass "没有录音跑到 end=max_duration（回声没进 VAD）"
 	else
-		bad "有 $echo_utt 段录音跑到 end=max_duration：回声还在进 VAD"
+		bad "有 $echo_utt 段录音跑到 end=max_duration（录到上限才停）：可能是回声，也可能是房间里别的声源——对照紧随其后的 USER_ASR 原文和 peak 判断，别直接去调采集阈值"
 	fi
 
-	# 5) 长回答没把采集判死（这一条同时盯 mipns 会不会自己关流）。
-	if [ "$cut" -eq 0 ]; then
-		pass "没有「timed out waiting for user speech」（长回答没被判死）"
+	# 5) 整轮答案没作废。原来查的 `timed out waiting for user speech` 在今天的代码里
+	#    恒不出现（is_capture_timeout 把它改写成 info "session idle timeout"，
+	#    原文只可能经由 error "turn failed: {err:?}" 出去，而空闲超时那条到不了那里），
+	#    所以改成查回声三连的最后一环：答案被当成提问 → 整轮失败。
+	if [ "$failed" -eq 0 ]; then
+		pass "没有整轮失败（turn failed）：回声没演变成「答案被当成提问」"
 	else
-		bad "出现 $cut 次「timed out waiting for user speech」：采集被判死了，查 mipns 是否自己关流"
+		bad "出现 $failed 次 turn failed：整轮答案作废了——可能是回声被当成提问后 LLM 失败，也可能是网络/ASR 服务故障，对照紧随其后的 USER_ASR 原文判断"
 	fi
+
+	# 只报数不判定：三步之间停顿超过 session_idle_timeout_s 也会出现，属正常。
+	[ "$idle" -eq 0 ] || note "session idle timeout 出现 $idle 次：三步之间停顿超过 session_idle_timeout_s 也会这样，不算失败"
 
 	# 6) 每一对 MUTED→UNMUTED 的时长：能看出是「跟着播放收」还是「跑满上限」。
 	intervals=$(grep -E 'CAPTURE_(MUTED|UNMUTED)' "$SLICE" 2>/dev/null | awk '
@@ -119,7 +198,8 @@ check)
 
 	echo
 	if [ "$fails" -eq 0 ]; then
-		printf '全部通过。把这段输出贴进 PR #34 的评论就够收尾了。\n'
+		printf '全部通过。把这段输出连同 USER_ASR 原文贴进 PR 评论就够收尾了。\n'
+		[ -z "$playback" ] || printf '注意：playback_command 是自定义的，断言 2/3 在本次配置下不可判读，别当证据。\n'
 		exit 0
 	fi
 	printf '%s 项未通过，见上面的 FAIL。\n' "$fails"
